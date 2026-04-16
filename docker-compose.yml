@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@db:5432/zuribot
+      - REDIS_URL=redis://redis:6379
+      - API_BASE_URL=${API_BASE_URL}
+      - WHATSAPP_API_VERSION=${WHATSAPP_API_VERSION}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_BUSINESS_ACCOUNT_ID=${WHATSAPP_BUSINESS_ACCOUNT_ID}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
+      - PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY}
+      - PAYSTACK_PUBLIC_KEY=${PAYSTACK_PUBLIC_KEY}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      - WEALTH_PLAN_AMOUNT=${WEALTH_PLAN_AMOUNT}
+      - BOOST_PLAN_AMOUNT=${BOOST_PLAN_AMOUNT}
+      - PREMIUM_PLAN_AMOUNT=${PREMIUM_PLAN_AMOUNT}
+      - GRACE_PERIOD_DAYS=${GRACE_PERIOD_DAYS}
+      - ENABLE_WEBHOOK_LOGGING=${ENABLE_WEBHOOK_LOGGING}
+      - ENABLE_MESSAGE_LOGGING=${ENABLE_MESSAGE_LOGGING}
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - zuribot-network
+
+  worker:
+    build: .
+    command: node dist/worker.js
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@db:5432/zuribot
+      - REDIS_URL=redis://redis:6379
+      - WHATSAPP_API_VERSION=${WHATSAPP_API_VERSION}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
+      - PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY}
+      - ENABLE_MESSAGE_LOGGING=${ENABLE_MESSAGE_LOGGING}
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - zuribot-network
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=zuribot
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - zuribot-network
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - zuribot-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  zuribot-network:
+    driver: bridge

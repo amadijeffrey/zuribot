@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  phoneNumber   String         @unique @map("phone_number")
+  name          String?
+  email         String?
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  
+  subscriptions Subscription[]
+  payments      Payment[]
+  
+  @@index([phoneNumber])
+  @@map("users")
+}
+
+model Subscription {
+  id            String             @id @default(uuid())
+  userId        String             @map("user_id")
+  planId        String             @map("plan_id")
+  status        SubscriptionStatus @default(ACTIVE)
+  startDate     DateTime           @map("start_date")
+  expiryDate    DateTime           @map("expiry_date")
+  graceEndDate  DateTime?          @map("grace_end_date")
+  groupInviteId String?            @map("group_invite_id")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+  
+  user          User               @relation(fields: [userId], references: [id])
+  payment       Payment?
+  group         Group?             @relation(fields: [groupInviteId], references: [id])
+  
+  @@index([userId])
+  @@index([status])
+  @@index([expiryDate])
+  @@index([graceEndDate])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id              String        @id @default(uuid())
+  userId          String        @map("user_id")
+  subscriptionId  String?       @unique @map("subscription_id")
+  reference       String        @unique @map("reference")
+  amount          Int           @map("amount")
+  currency        String        @default("NGN") @map("currency")
+  status          PaymentStatus @default(PENDING) @map("status")
+  planId          String        @map("plan_id")
+  paystackData    Json?         @map("paystack_data")
+  paidAt          DateTime?     @map("paid_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+  
+  user            User          @relation(fields: [userId], references: [id])
+  subscription    Subscription? @relation(fields: [subscriptionId], references: [id])
+  
+  @@index([userId])
+  @@index([reference])
+  @@index([status])
+  @@map("payments")
+}
+
+model Group {
+  id            String         @id @default(uuid())
+  planId        String         @unique @map("plan_id")
+  name          String         @map("name")
+  inviteLink    String         @map("invite_link")
+  isActive      Boolean        @default(true) @map("is_active")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  
+  subscriptions Subscription[]
+  
+  @@index([planId])
+  @@map("groups")
+}
+
+model WebhookLog {
+  id          String   @id @default(uuid())
+  source      String   @map("source")
+  eventType   String   @map("event_type")
+  payload     Json     @map("payload")
+  processed   Boolean  @default(false) @map("processed")
+  error       String?   @map("error")
+  createdAt   DateTime @default(now()) @map("created_at")
+  
+  @@index([source, createdAt])
+  @@index([processed])
+  @@map("webhook_logs")
+}
+
+model MessageLog {
+  id          String   @id @default(uuid())
+  phoneNumber String  @map("phone_number")
+  direction   String   @map("direction")
+  messageType String   @map("message_type")
+  content     String   @map("content")
+  messageId   String?  @map("message_id")
+  status      String?  @map("status")
+  createdAt   DateTime @default(now()) @map("created_at")
+  
+  @@index([phoneNumber, createdAt])
+  @@map("message_logs")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  GRACE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
