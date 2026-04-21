@@ -61,7 +61,7 @@ export const getSubscriptionsHandler = async (req: Request, res: Response): Prom
   res.json(result);
 };
 
-export const getStats = async (req: Request, res: Response): Promise<void> => {
+export const getStats = async (_req: Request, res: Response): Promise<void> => {
   const [subscriptionStats, userCount, paymentStats] = await Promise.all([
     getSubscriptionStats(),
     prisma.user.count(),
@@ -211,7 +211,7 @@ export const broadcast = async (req: Request, res: Response): Promise<void> => {
   res.json({ success: true, sent, failed, total: uniqueUsers.length });
 };
 
-export const getGroups = async (req: Request, res: Response): Promise<void> => {
+export const getGroups = async (_req: Request, res: Response): Promise<void> => {
   const groups = await prisma.group.findMany({
     include: { _count: { select: { subscriptions: true } } },
   });
