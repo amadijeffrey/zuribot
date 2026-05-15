@@ -31,9 +31,11 @@ model Subscription {
   startDate     DateTime           @map("start_date")
   expiryDate    DateTime           @map("expiry_date")
   graceEndDate  DateTime?          @map("grace_end_date")
-  groupInviteId String?            @map("group_invite_id")
-  createdAt     DateTime           @default(now()) @map("created_at")
-  updatedAt     DateTime           @updatedAt @map("updated_at")
+  groupInviteId               String?            @map("group_invite_id")
+  paystackSubscriptionCode    String?            @unique @map("paystack_subscription_code")
+  paystackEmailToken          String?            @map("paystack_email_token")
+  createdAt                   DateTime           @default(now()) @map("created_at")
+  updatedAt                   DateTime           @updatedAt @map("updated_at")
   
   user          User               @relation(fields: [userId], references: [id])
   payment       Payment?

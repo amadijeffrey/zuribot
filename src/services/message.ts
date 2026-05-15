@@ -4,7 +4,7 @@ import { SUBSCRIPTION_PLANS, UPGRADE_KEYWORDS } from '../config/constants';
 import { getOrCreateUser } from './user';
 import { initializePayment } from './payment';
 import { sendTextMessage, sendInteractiveButtons, sendInteractiveList } from './whatsapp';
-import { getActiveSubscription, getUserLatestSubscription } from './subscription';
+import { getActiveSubscription, getActiveSubscriptions, getUserLatestSubscription } from './subscription';
 import { logger } from '../utils/logger';
 import { IncomingMessage, WebhookContact } from '../types/whatsapp.types';
 
@@ -144,7 +144,7 @@ const handleSubscriptionRequest = async (user: any, planId: string): Promise<voi
   // Check for existing active subscription to same plan
   const existingSubscription = await getActiveSubscription(user.id);
 
-  if (existingSubscription && existingSubscription.planId === planId) {
+  if (existingSubscription && existingSubscription.planId === planId && existingSubscription.status === 'ACTIVE') {
     const expiryDate = existingSubscription.expiryDate.toLocaleDateString();
     await sendTextMessage(
       phoneNumber,
@@ -157,7 +157,6 @@ const handleSubscriptionRequest = async (user: any, planId: string): Promise<voi
   const payment = await initializePayment({
     userId: user.id,
     planId: plan.id,
-    amount: plan.amount,
     email: user.email || `${phoneNumber}@whatsapp.placeholder.com`,
   });
 
@@ -180,9 +179,9 @@ const handleSubscriptionRequest = async (user: any, planId: string): Promise<voi
 };
 
 const handleStatusCheck = async (user: any): Promise<void> => {
-  const subscription = await getActiveSubscription(user.id);
+  const subscriptions = await getActiveSubscriptions(user.id);
 
-  if (!subscription) {
+  if (subscriptions.length === 0) {
     await sendTextMessage(
       user.phoneNumber,
       "You don't have an active subscription.\n\nReply with *UPGRADE* to see available plans."
@@ -190,21 +189,24 @@ const handleStatusCheck = async (user: any): Promise<void> => {
     return;
   }
 
-  const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
-  const expiryDate = subscription.expiryDate.toLocaleDateString();
-  const daysRemaining = Math.ceil(
-    (subscription.expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)
-  );
+  const lines = subscriptions.map(subscription => {
+    const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
+    const expiryDate = subscription.expiryDate.toLocaleDateString();
+    const daysRemaining = Math.max(
+      Math.ceil((subscription.expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)),
+      0
+    );
+    const statusEmoji = subscription.status === 'GRACE' ? '⚠️' : '✅';
+    const statusText = subscription.status === 'GRACE' ? 'Grace Period' : 'Active';
 
-  const statusEmoji = subscription.status === 'GRACE' ? '⚠️' : '✅';
-  const statusText = subscription.status === 'GRACE' ? 'Grace Period' : 'Active';
+    return `📋 *Plan:* ${plan?.name || subscription.planId}\n` +
+      `${statusEmoji} *Status:* ${statusText}\n` +
+      `📅 *Expires:* ${expiryDate}\n` +
+      `⏳ *Days Remaining:* ${daysRemaining}` +
+      `${subscription.status === 'GRACE' ? '\n⚠️ Renew now to maintain access!' : ''}`;
+  });
 
-  const message = `*Your Subscription Status*\n\n` +
-    `📋 *Plan:* ${plan?.name || subscription.planId}\n` +
-    `${statusEmoji} *Status:* ${statusText}\n` +
-    `📅 *Expires:* ${expiryDate}\n` +
-    `⏳ *Days Remaining:* ${Math.max(daysRemaining, 0)}\n\n` +
-    `${subscription.status === 'GRACE' ? '⚠️ Your subscription has expired. Renew now to maintain access!' : ''}`;
+  const message = `*Your Subscription Status*\n\n` + lines.join('\n\n─────────────\n\n');
 
   await sendTextMessage(user.phoneNumber, message);
 };

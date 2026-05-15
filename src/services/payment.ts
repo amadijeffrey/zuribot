@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../config/database';
 import { env } from '../config/env';
 import { SUBSCRIPTION_PLANS, GRACE_PERIOD_DAYS } from '../config/constants';
-import { sendActivationConfirmation } from './subscription';
+import { sendActivationConfirmation, moveToGracePeriod } from './subscription';
 import { logger } from '../utils/logger';
 import { InitializePaymentParams, InitializePaymentResult } from '../types';
 
@@ -18,7 +18,10 @@ const paystackClient = axios.create({
 export const initializePayment = async (
   params: InitializePaymentParams
 ): Promise<InitializePaymentResult> => {
-  const { userId, planId, amount, email } = params;
+  const { userId, planId, email } = params;
+  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+
+  if (!plan) throw new Error(`Unknown plan: ${planId}`);
 
   const reference = `SUB_${planId.toUpperCase()}_${uuidv4().slice(0, 8)}`;
 
@@ -27,17 +30,24 @@ export const initializePayment = async (
       data: {
         userId,
         reference,
-        amount,
+        amount: plan.amount,
         planId,
         status: 'PENDING',
       },
     });
 
+    logger.info('Initializing Paystack transaction', {
+      reference,
+      planId,
+      paystackPlanCode: plan.paystackPlanCode,
+    });
+
     const response = await paystackClient.post('/transaction/initialize', {
       email,
-      amount,
+      amount: plan.amount,
       reference,
-      callback_url: `${env.API_BASE_URL}/payment/callback`,
+      plan: plan.paystackPlanCode,
+      // callback_url: `${env.API_BASE_URL}/payment/callback`,
       metadata: {
         userId,
         planId,
@@ -51,7 +61,13 @@ export const initializePayment = async (
       },
     });
 
-    logger.info('Payment initialized', { reference, userId, planId, amount });
+    logger.info('Paystack transaction initialized', {
+      reference,
+      userId,
+      planId,
+      paystackPlanCode: plan.paystackPlanCode,
+      authorizationUrl: response.data.data.authorization_url,
+    });
 
     return {
       reference,
@@ -74,7 +90,7 @@ export const verifyPayment = async (reference: string): Promise<boolean> => {
     const data = response.data.data;
 
     if (data.status === 'success') {
-      await handleSuccessfulPayment(reference, data);
+      await handleInitialPayment(reference, data);
       return true;
     }
 
@@ -89,35 +105,30 @@ export const verifyPayment = async (reference: string): Promise<boolean> => {
 };
 
 export const processWebhookEvent = async (event: any): Promise<void> => {
-  const { reference, status } = event.data;
-
   logger.info('Processing Paystack webhook', {
     event: event.event,
-    reference,
-    status,
+    reference: event.data?.reference,
   });
-
-  const existingPayment = await prisma.payment.findUnique({
-    where: { reference },
-  });
-
-  if (!existingPayment) {
-    logger.warn('Payment not found for webhook', { reference });
-    return;
-  }
-
-  if (existingPayment.status === 'SUCCESS') {
-    logger.info('Payment already processed, skipping', { reference });
-    return;
-  }
 
   switch (event.event) {
     case 'charge.success':
-      await handleSuccessfulPayment(reference, event.data);
+      await handleChargeSuccess(event.data);
       break;
 
     case 'charge.failed':
-      await handleFailedPayment(reference);
+      await handleFailedPayment(event.data.reference);
+      break;
+
+    case 'subscription.create':
+      await handleSubscriptionCreated(event.data);
+      break;
+
+    case 'subscription.disable':
+      await handleSubscriptionDisabled(event.data);
+      break;
+
+    case 'invoice.payment_failed':
+      await handleInvoicePaymentFailed(event.data);
       break;
 
     default:
@@ -125,7 +136,32 @@ export const processWebhookEvent = async (event: any): Promise<void> => {
   }
 };
 
-const handleSuccessfulPayment = async (reference: string, data: any): Promise<void> => {
+// --- charge.success ---
+
+const handleChargeSuccess = async (data: any): Promise<void> => {
+  const isRecurring = !!data.subscription?.subscription_code;
+
+  if (isRecurring) {
+    await handleRecurringCharge(data);
+    return;
+  }
+
+  const payment = await prisma.payment.findUnique({ where: { reference: data.reference } });
+
+  if (!payment) {
+    logger.warn('Payment not found for charge.success', { reference: data.reference });
+    return;
+  }
+
+  if (payment.status === 'SUCCESS') {
+    logger.info('Payment already processed, skipping', { reference: data.reference });
+    return;
+  }
+
+  await handleInitialPayment(data.reference, data);
+};
+
+const handleInitialPayment = async (reference: string, data: any): Promise<void> => {
   const payment = await prisma.payment.findUnique({
     where: { reference },
     include: { user: true },
@@ -147,20 +183,15 @@ const handleSuccessfulPayment = async (reference: string, data: any): Promise<vo
     });
 
     const plan = SUBSCRIPTION_PLANS[payment.planId as keyof typeof SUBSCRIPTION_PLANS];
-    if (!plan) {
-      throw new Error(`Plan not found: ${payment.planId}`);
-    }
+    if (!plan) throw new Error(`Plan not found: ${payment.planId}`);
 
     const startDate = new Date();
-    const expiryDate = new Date();
-    expiryDate.setDate(expiryDate.getDate() + plan.durationDays);
+    const expiryDate = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
 
     const graceEndDate = new Date(expiryDate);
     graceEndDate.setDate(graceEndDate.getDate() + GRACE_PERIOD_DAYS);
 
-    const group = await tx.group.findUnique({
-      where: { planId: payment.planId },
-    });
+    const group = await tx.group.findUnique({ where: { planId: payment.planId } });
 
     const subscription = await tx.subscription.create({
       data: {
@@ -171,6 +202,8 @@ const handleSuccessfulPayment = async (reference: string, data: any): Promise<vo
         expiryDate,
         graceEndDate,
         groupInviteId: group?.id,
+        paystackSubscriptionCode: data.subscription?.subscription_code ?? null,
+        paystackEmailToken: data.subscription?.email_token ?? null,
       },
     });
 
@@ -190,8 +223,146 @@ const handleSuccessfulPayment = async (reference: string, data: any): Promise<vo
   await sendActivationConfirmation(payment.userId, payment.planId);
 };
 
+const handleRecurringCharge = async (data: any): Promise<void> => {
+  const subscriptionCode = data.subscription.subscription_code;
+
+  const subscription = await prisma.subscription.findFirst({
+    where: { paystackSubscriptionCode: subscriptionCode },
+  });
+
+  if (!subscription) {
+    logger.warn('Subscription not found for recurring charge', { subscriptionCode });
+    return;
+  }
+
+  const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
+  if (!plan) return;
+
+  await prisma.$transaction(async (tx) => {
+    const expiryDate = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
+
+    const graceEndDate = new Date(expiryDate);
+    graceEndDate.setDate(graceEndDate.getDate() + GRACE_PERIOD_DAYS);
+
+    const newPayment = await tx.payment.create({
+      data: {
+        userId: subscription.userId,
+        reference: data.reference,
+        amount: data.amount,
+        planId: subscription.planId,
+        status: 'SUCCESS',
+        paidAt: new Date(data.paid_at || Date.now()),
+        paystackData: data,
+        subscriptionId: subscription.id,
+      },
+    });
+
+    await tx.subscription.update({
+      where: { id: subscription.id },
+      data: {
+        status: 'ACTIVE',
+        expiryDate,
+        graceEndDate,
+      },
+    });
+
+    logger.info('Subscription renewed', {
+      subscriptionCode,
+      paymentId: newPayment.id,
+      userId: subscription.userId,
+      expiryDate,
+    });
+  });
+};
+
+// --- subscription.create ---
+
+const handleSubscriptionCreated = async (data: any): Promise<void> => {
+  const { subscription_code, email_token } = data;
+  const customerEmail = data.customer?.email;
+  const planCode = data.plan?.plan_code;
+
+  // Try updating by subscription_code first (charge.success already stored it)
+  const updated = await prisma.subscription.updateMany({
+    where: { paystackSubscriptionCode: subscription_code },
+    data: { paystackEmailToken: email_token },
+  });
+
+  // If nothing matched, charge.success didn't store the code — find the subscription
+  // by the customer phone/email + plan and backfill both the code and email token
+  if (updated.count === 0 && customerEmail && planCode) {
+    const phoneNumber = customerEmail.endsWith('@whatsapp.placeholder.com')
+      ? customerEmail.replace('@whatsapp.placeholder.com', '')
+      : null;
+
+    const user = await prisma.user.findFirst({
+      where: phoneNumber ? { phoneNumber } : { email: customerEmail },
+    });
+
+    if (user) {
+      const plan = Object.values(SUBSCRIPTION_PLANS).find(
+        p => p.paystackPlanCode === planCode
+      );
+
+      if (plan) {
+        await prisma.subscription.updateMany({
+          where: {
+            userId: user.id,
+            planId: plan.id,
+            paystackSubscriptionCode: null,
+            status: { in: ['ACTIVE', 'GRACE'] },
+          },
+          data: {
+            paystackSubscriptionCode: subscription_code,
+            paystackEmailToken: email_token,
+          },
+        });
+
+        logger.info('Backfilled missing subscription code', { subscription_code, userId: user.id });
+      }
+    }
+  }
+
+  logger.info('Subscription created event processed', { subscription_code });
+};
+
+// --- subscription.disable ---
+
+const handleSubscriptionDisabled = async (data: any): Promise<void> => {
+  const { subscription_code } = data;
+
+  await prisma.subscription.updateMany({
+    where: { paystackSubscriptionCode: subscription_code },
+    data: { status: 'CANCELLED' },
+  });
+
+  logger.info('Subscription cancelled', { subscription_code });
+};
+
+// --- invoice.payment_failed ---
+
+const handleInvoicePaymentFailed = async (data: any): Promise<void> => {
+  const subscriptionCode = data.subscription?.subscription_code;
+  if (!subscriptionCode) return;
+
+  const subscription = await prisma.subscription.findUnique({
+    where: { paystackSubscriptionCode: subscriptionCode },
+  });
+
+  if (!subscription) {
+    logger.warn('Subscription not found for failed invoice', { subscriptionCode });
+    return;
+  }
+
+  await moveToGracePeriod(subscription.id);
+
+  logger.info('Subscription moved to grace after failed invoice', { subscriptionCode });
+};
+
+// --- charge.failed ---
+
 const handleFailedPayment = async (reference: string): Promise<void> => {
-  await prisma.payment.update({
+  await prisma.payment.updateMany({
     where: { reference },
     data: { status: 'FAILED' },
   });

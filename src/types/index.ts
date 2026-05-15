@@ -3,7 +3,6 @@ export * from './whatsapp.types';
 export interface InitializePaymentParams {
   userId: string;
   planId: string;
-  amount: number;
   email: string;
 }
 

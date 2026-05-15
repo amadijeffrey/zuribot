@@ -4,6 +4,8 @@ import { prisma } from './config/database';
 import { redisConnection } from './config/redis';
 import { initializeScheduler } from './jobs/cron/scheduler';
 import { closeQueues } from './jobs/queue';
+import { closeMessageWorker } from './jobs/workers/message.worker';
+import { closeNotificationWorker } from './jobs/workers/notification.worker';
 import { logger } from './utils/logger';
 
 const startServer = async () => {
@@ -35,6 +37,8 @@ const startServer = async () => {
         logger.info('HTTP server closed');
 
         try {
+          await closeMessageWorker();
+          await closeNotificationWorker();
           await closeQueues();
           await prisma.$disconnect();
           await redisConnection.quit();

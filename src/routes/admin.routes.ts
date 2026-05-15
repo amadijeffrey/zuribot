@@ -18,6 +18,7 @@ router.post('/users/:id/send-message', adminHandler.sendMessageToUser);
 // Subscriptions
 router.get('/subscriptions', adminHandler.getSubscriptionsHandler);
 router.post('/subscriptions/:id/extend', adminHandler.extendSubscription);
+router.post('/subscriptions/:id/simulate-payment-failed', adminHandler.simulatePaymentFailed);
 
 // Payments
 router.get('/payments', adminHandler.getPayments);

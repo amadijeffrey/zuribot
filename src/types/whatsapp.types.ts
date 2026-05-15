@@ -89,7 +89,7 @@ export interface TemplateParameter {
 }
 
 export interface InteractiveMessage {
-  type: 'button' | 'list';
+  type: 'button' | 'list' | 'cta_url';
   header?: { type: string; text?: string };
   body: { text: string };
   footer?: { text: string };
@@ -100,6 +100,8 @@ export interface InteractiveAction {
   button?: string;
   buttons?: InteractiveButton[];
   sections?: InteractiveSection[];
+  name?: string;
+  parameters?: { display_text: string; url: string };
 }
 
 export interface InteractiveButton {

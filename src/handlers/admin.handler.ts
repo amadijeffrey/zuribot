@@ -1,12 +1,13 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/database';
-import { 
-  getActiveSubscription, 
-  getSubscriptionStats, 
+import {
+  getActiveSubscription,
+  getSubscriptionStats,
   getSubscriptions,
-  extendSubscription as extendSub 
+  extendSubscription as extendSub,
+  moveToGracePeriod,
 } from '../services/subscription';
-import { sendTextMessage } from '../services/whatsapp';
+import { sendTextMessage, sendCtaUrlMessage } from '../services/whatsapp';
 import { logger } from '../utils/logger';
 
 export const getUsers = async (req: Request, res: Response): Promise<void> => {
@@ -114,9 +115,12 @@ export const resendGroupLink = async (req: Request, res: Response): Promise<void
     return;
   }
 
-  await sendTextMessage(
+  await sendCtaUrlMessage(
     user.phoneNumber,
-    `Here's your group invite link:\n\n${group.inviteLink}\n\n_This link is exclusive to subscribers._`
+    `Tap the button below to join your exclusive group.`,
+    'Join the group',
+    group.inviteLink,
+    'This link is exclusive to your subscription.'
   );
 
   logger.info('Group link resent', { userId: id, adminAction: true });
@@ -142,6 +146,25 @@ export const sendMessageToUser = async (req: Request, res: Response): Promise<vo
 
   logger.info('Manual message sent', { userId: id, adminAction: true });
   res.json({ success: true, messageId });
+};
+
+export const simulatePaymentFailed = async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  const subscription = await prisma.subscription.findUnique({ where: { id } });
+  if (!subscription) {
+    res.status(404).json({ error: 'Subscription not found' });
+    return;
+  }
+
+  if (subscription.status !== 'ACTIVE') {
+    res.status(400).json({ error: `Subscription is not ACTIVE (current: ${subscription.status})` });
+    return;
+  }
+
+  await moveToGracePeriod(id);
+  logger.info('Grace period simulated', { subscriptionId: id, adminAction: true });
+  res.json({ success: true, message: 'Subscription moved to GRACE period' });
 };
 
 export const extendSubscription = async (req: Request, res: Response): Promise<void> => {

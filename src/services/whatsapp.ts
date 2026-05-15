@@ -74,6 +74,35 @@ export const sendInteractiveList = async (
   return sendMessage(payload);
 };
 
+export const sendCtaUrlMessage = async (
+  to: string,
+  bodyText: string,
+  displayText: string,
+  url: string,
+  footerText?: string
+): Promise<string | null> => {
+  const payload: SendMessagePayload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'cta_url',
+      body: { text: bodyText },
+      footer: footerText ? { text: footerText } : undefined,
+      action: {
+        name: 'cta_url',
+        parameters: {
+          display_text: displayText,
+          url,
+        },
+      },
+    },
+  };
+
+  return sendMessage(payload);
+};
+
 export const sendTemplateMessage = async (
   to: string,
   templateName: string,

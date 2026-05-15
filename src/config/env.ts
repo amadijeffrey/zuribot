@@ -20,10 +20,15 @@ const envSchema = z.object({
   
   PAYSTACK_SECRET_KEY: z.string(),
   PAYSTACK_PUBLIC_KEY: z.string(),
-  
+  PAYSTACK_WEALTH_PLAN_CODE: z.string().min(1),
+  PAYSTACK_HEALTH_PLAN_CODE: z.string().min(1),
+  PAYSTACK_BOOST_PLAN_CODE: z.string().min(1),
+  PAYSTACK_PREMIUM_PLAN_CODE: z.string().min(1),
+
   ADMIN_API_KEY: z.string(),
-  
+
   WEALTH_PLAN_AMOUNT: z.string().transform(Number).default('500000'),
+  HEALTH_PLAN_AMOUNT: z.string().transform(Number).default('500000'),
   BOOST_PLAN_AMOUNT: z.string().transform(Number).default('1000000'),
   PREMIUM_PLAN_AMOUNT: z.string().transform(Number).default('2500000'),
   GRACE_PERIOD_DAYS: z.string().transform(Number).default('3'),

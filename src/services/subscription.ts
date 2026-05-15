@@ -1,11 +1,22 @@
 import { prisma } from '../config/database';
 import { SUBSCRIPTION_PLANS, GRACE_PERIOD_DAYS } from '../config/constants';
-import { sendTextMessage } from './whatsapp';
+import { sendTextMessage, sendCtaUrlMessage } from './whatsapp';
 import { logger } from '../utils/logger';
 import { SubscriptionStats } from '../types';
 
 export const getActiveSubscription = async (userId: string) => {
   return prisma.subscription.findFirst({
+    where: {
+      userId,
+      status: { in: ['ACTIVE', 'GRACE'] },
+    },
+    orderBy: { createdAt: 'desc' },
+    include: { group: true },
+  });
+};
+
+export const getActiveSubscriptions = async (userId: string) => {
+  return prisma.subscription.findMany({
     where: {
       userId,
       status: { in: ['ACTIVE', 'GRACE'] },
@@ -81,6 +92,7 @@ export const getExpiredSubscriptions = async () => {
     where: {
       status: 'ACTIVE',
       expiryDate: { lte: new Date() },
+      paystackSubscriptionCode: null,
     },
     include: { user: true },
   });
@@ -107,22 +119,26 @@ export const sendActivationConfirmation = async (
   }
 
   const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
-  const group = await prisma.group.findUnique({ where: { planId } });
+  // const group = await prisma.group.findUnique({ where: { planId } });
   const subscription = await getActiveSubscription(userId);
   const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
 
-  let message = `🎉 *Payment Successful!*\n\n` +
+  const message = `🎉 *Payment Successful!*\n\n` +
     `Your *${plan?.name}* subscription is now active!\n\n` +
-    `📅 *Expires:* ${expiryDate}\n`;
-
-  if (group?.inviteLink) {
-    message += `\n🔗 *Join the group:*\n${group.inviteLink}\n\n` +
-      `_This link is exclusive to subscribers. Do not share._`;
-  }
-
-  message += `\n\nReply *STATUS* anytime to check your subscription.`;
+    `📅 *Expires:* ${expiryDate}\n\n` +
+    `Reply *STATUS* anytime to check your subscription.`;
 
   await sendTextMessage(user.phoneNumber, message);
+
+  if (plan?.inviteLink) {
+    await sendCtaUrlMessage(
+      user.phoneNumber,
+      `Tap the button below to join your exclusive *${plan?.name}* group.`,
+      'Join the group',
+      plan.inviteLink,
+      'This link is exclusive to your subscription.'
+    );
+  }
   logger.info('Activation confirmation sent', { userId, planId });
 };
 
