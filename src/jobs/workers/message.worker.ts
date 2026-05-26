@@ -20,7 +20,11 @@ export const messageWorker = new Worker(
   },
   {
     connection: redisConnection,
-    concurrency: 10,
+    // Each job does network-bound work (Paystack/WhatsApp HTTP + a few DB
+    // queries). Throughput is capped by upstream APIs, not local parallelism,
+    // so keep concurrency low to stay well under the Prisma connection pool.
+    // Scale horizontally (more replicas) before raising this.
+    concurrency: 3,
   }
 );
 

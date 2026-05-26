@@ -2,9 +2,9 @@ import { prisma } from '../config/database';
 import { env } from '../config/env';
 import { SUBSCRIPTION_PLANS, UPGRADE_KEYWORDS } from '../config/constants';
 import { getOrCreateUser } from './user';
-import { initializePayment } from './payment';
+import { initializePayment, initializeRenewalPayment } from './payment';
 import { sendTextMessage, sendInteractiveButtons, sendInteractiveList } from './whatsapp';
-import { getActiveSubscription, getActiveSubscriptions, getUserLatestSubscription } from './subscription';
+import { getActiveSubscriptions, getSubscriptionForPlan } from './subscription';
 import { logger } from '../utils/logger';
 import { IncomingMessage, WebhookContact } from '../types/whatsapp.types';
 
@@ -141,14 +141,26 @@ const handleSubscriptionRequest = async (user: any, planId: string): Promise<voi
     return;
   }
 
-  // Check for existing active subscription to same plan
-  const existingSubscription = await getActiveSubscription(user.id);
+  // Check for an existing ACTIVE or GRACE subscription for THIS plan
+  // (scoped to planId so multi-plan users don't get a duplicate row when
+  // they subscribe to a plan they already hold). Latest first.
+  const existingForPlan = await getSubscriptionForPlan(user.id, planId);
 
-  if (existingSubscription && existingSubscription.planId === planId && existingSubscription.status === 'ACTIVE') {
-    const expiryDate = existingSubscription.expiryDate.toLocaleDateString();
+  if (existingForPlan) {
+    if (existingForPlan.status === 'ACTIVE') {
+      const expiryDate = existingForPlan.expiryDate.toLocaleDateString();
+      await sendTextMessage(
+        phoneNumber,
+        `You already have an active *${plan.name}* subscription that expires on ${expiryDate}.`
+      );
+      return;
+    }
+
+    // GRACE: don't create a new sub or open a new Paystack subscription —
+    // direct them to RENEW so the existing row is auth-charged in place.
     await sendTextMessage(
       phoneNumber,
-      `You already have an active *${plan.name}* subscription that expires on ${expiryDate}.\n\nTo renew early, reply with *RENEW*.`
+      `Your *${plan.name}* subscription is in its grace period. Reply *RENEW* to reactivate it using your saved card, or *UPGRADE* to view other plans.`
     );
     return;
   }
@@ -212,12 +224,96 @@ const handleStatusCheck = async (user: any): Promise<void> => {
 };
 
 const handleRenewalRequest = async (user: any): Promise<void> => {
-  const subscription = await getUserLatestSubscription(user.id);
+  const subscriptions = await getActiveSubscriptions(user.id);
 
-  if (subscription) {
-    await handleSubscriptionRequest(user, subscription.planId);
-  } else {
+  if (subscriptions.length === 0) {
+    await sendTextMessage(
+      user.phoneNumber,
+      "You don't have any subscriptions to renew. Reply *UPGRADE* to view available plans."
+    );
+    return;
+  }
+
+  // Dedupe by planId — keep the most recent per plan (subscriptions are
+  // already ordered createdAt desc), so orphaned rows don't surface as
+  // duplicate options.
+  const latestByPlan = new Map<string, typeof subscriptions[number]>();
+  for (const sub of subscriptions) {
+    if (!latestByPlan.has(sub.planId)) latestByPlan.set(sub.planId, sub);
+  }
+
+  const rows = Array.from(latestByPlan.values()).flatMap(sub => {
+    const plan = SUBSCRIPTION_PLANS[sub.planId as keyof typeof SUBSCRIPTION_PLANS];
+    if (!plan) return [];
+    const statusLabel = sub.status === 'GRACE' ? 'In grace' : 'Active';
+    return [{
+      id: `renew_plan_${sub.planId}`,
+      title: plan.name,
+      description: `${statusLabel} • Expires ${sub.expiryDate.toLocaleDateString()}`,
+    }];
+  });
+
+  if (rows.length === 0) {
     await sendAvailablePlans(user.phoneNumber);
+    return;
+  }
+
+  await sendInteractiveList(
+    user.phoneNumber,
+    '🔄 *Renew a Subscription*\n\nSelect the subscription you want to renew.',
+    'Select Plan',
+    [{ title: 'Your Subscriptions', rows }],
+    'Renewal',
+    'Tap to choose'
+  );
+};
+
+const handleRenewalSelection = async (user: any, planId: string): Promise<void> => {
+  const subscriptions = await getActiveSubscriptions(user.id);
+  const target = subscriptions.find(s => s.planId === planId && s.status === 'GRACE');
+
+  // Non-GRACE picks (ACTIVE early-renewal, or no matching sub) fall back to
+  // the regular payment flow — handleSubscriptionRequest covers the
+  // "already active" UX and the new-subscribe path for users with no
+  // current sub for the plan.
+  if (!target) {
+    await handleSubscriptionRequest(user, planId);
+    return;
+  }
+
+  const plan = SUBSCRIPTION_PLANS[target.planId as keyof typeof SUBSCRIPTION_PLANS];
+  if (!plan) {
+    await sendTextMessage(user.phoneNumber, 'Plan not found.');
+    return;
+  }
+
+  try {
+    // Issue a fresh Paystack payment link tied to the existing subscription.
+    // The eventual charge.success webhook will extend this sub in place
+    // (applyRenewalCharge) instead of creating a new Subscription row.
+    const payment = await initializeRenewalPayment(target.id);
+
+    const message = `🔄 *${plan.name} — Renewal*\n\n` +
+      `💰 *Amount:* ₦${(plan.amount / 100).toLocaleString()}\n` +
+      `⏱️ *Extends by:* ${plan.durationDays} days\n\n` +
+      `Click the link below to complete your renewal:\n\n` +
+      `${payment.authorizationUrl}\n\n` +
+      `_Reference: ${payment.reference}_`;
+
+    await sendTextMessage(user.phoneNumber, message);
+
+    logger.info('Renewal payment link sent', {
+      userId: user.id,
+      subscriptionId: target.id,
+      planId,
+      reference: payment.reference,
+    });
+  } catch (error) {
+    logger.error('Renewal selection failed', { userId: user.id, planId, error });
+    await sendTextMessage(
+      user.phoneNumber,
+      "We hit a problem starting your renewal. Please try again or reply *UPGRADE* to view plans.",
+    );
   }
 };
 
@@ -272,6 +368,13 @@ const handleInteractiveMessage = async (user: any, message: IncomingMessage): Pr
   if (selectedId.startsWith('select_plan_')) {
     const planId = selectedId.replace('select_plan_', '');
     await handleSubscriptionRequest(user, planId);
+    return;
+  }
+
+  // Handle renewal selection from list
+  if (selectedId.startsWith('renew_plan_')) {
+    const planId = selectedId.replace('renew_plan_', '');
+    await handleRenewalSelection(user, planId);
     return;
   }
 

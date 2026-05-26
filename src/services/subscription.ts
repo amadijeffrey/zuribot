@@ -11,7 +11,6 @@ export const getActiveSubscription = async (userId: string) => {
       status: { in: ['ACTIVE', 'GRACE'] },
     },
     orderBy: { createdAt: 'desc' },
-    include: { group: true },
   });
 };
 
@@ -22,13 +21,22 @@ export const getActiveSubscriptions = async (userId: string) => {
       status: { in: ['ACTIVE', 'GRACE'] },
     },
     orderBy: { createdAt: 'desc' },
-    include: { group: true },
   });
 };
 
 export const getUserLatestSubscription = async (userId: string) => {
   return prisma.subscription.findFirst({
     where: { userId },
+    orderBy: { createdAt: 'desc' },
+  });
+};
+
+// Returns the user's ACTIVE or GRACE subscription for a SPECIFIC plan. Used by
+// the keyword-subscribe path so multi-plan users don't accidentally create a
+// duplicate row for a plan they already hold.
+export const getSubscriptionForPlan = async (userId: string, planId: string) => {
+  return prisma.subscription.findFirst({
+    where: { userId, planId, status: { in: ['ACTIVE', 'GRACE'] } },
     orderBy: { createdAt: 'desc' },
   });
 };
@@ -66,33 +74,20 @@ export const expireSubscription = async (subscriptionId: string): Promise<void> 
   await sendExpiryNotification(subscription.user.phoneNumber, subscription.planId);
 };
 
-export const getSubscriptionsExpiringWithin = async (days: number) => {
-  const targetDate = new Date();
-  targetDate.setDate(targetDate.getDate() + days);
-  targetDate.setHours(23, 59, 59, 999);
-
-  const startOfDay = new Date();
-  startOfDay.setDate(startOfDay.getDate() + days);
-  startOfDay.setHours(0, 0, 0, 0);
-
-  return prisma.subscription.findMany({
-    where: {
-      status: 'ACTIVE',
-      expiryDate: {
-        gte: startOfDay,
-        lte: targetDate,
-      },
-    },
-    include: { user: true },
-  });
-};
-
 export const getExpiredSubscriptions = async () => {
+  const now = new Date();
+  // For recurring subs, give the renewal webhook a 24h buffer to arrive before
+  // we treat the sub as expired. The webhook is the primary path; this cron is
+  // the safety net for missed deliveries (Paystack outage, our downtime, etc.).
+  const recurringBuffer = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
   return prisma.subscription.findMany({
     where: {
       status: 'ACTIVE',
-      expiryDate: { lte: new Date() },
-      paystackSubscriptionCode: null,
+      OR: [
+        { paystackSubscriptionCode: null, expiryDate: { lte: now } },
+        { paystackSubscriptionCode: { not: null }, expiryDate: { lte: recurringBuffer } },
+      ],
     },
     include: { user: true },
   });
@@ -119,7 +114,6 @@ export const sendActivationConfirmation = async (
   }
 
   const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
-  // const group = await prisma.group.findUnique({ where: { planId } });
   const subscription = await getActiveSubscription(userId);
   const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
 
@@ -140,6 +134,32 @@ export const sendActivationConfirmation = async (
     );
   }
   logger.info('Activation confirmation sent', { userId, planId });
+};
+
+// Renewal confirmation — same access-extended message, but no group invite
+// CTA (the user is already in the group; re-sending the link is noise and
+// can confuse them into thinking they need to re-join).
+export const sendRenewalConfirmation = async (
+  userId: string,
+  planId: string,
+): Promise<void> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    logger.error('User not found for renewal confirmation', { userId });
+    return;
+  }
+
+  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+  const subscription = await getActiveSubscription(userId);
+  const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
+
+  const message = `🔄 *Renewal Successful!*\n\n` +
+    `Your *${plan?.name}* subscription has been renewed.\n\n` +
+    `📅 *New expiry:* ${expiryDate}\n\n` +
+    `Reply *STATUS* anytime to check your subscription.`;
+
+  await sendTextMessage(user.phoneNumber, message);
+  logger.info('Renewal confirmation sent', { userId, planId });
 };
 
 const sendGracePeriodNotification = async (
@@ -179,9 +199,8 @@ export const sendExpiryReminder = async (
   const emoji = daysRemaining === 1 ? '🚨' : daysRemaining <= 3 ? '⚠️' : '📢';
 
   const message = `${emoji} *Subscription Expiring Soon*\n\n` +
-    `Your *${plan?.name}* subscription expires in ${daysRemaining} day${daysRemaining > 1 ? 's' : ''}.\n\n` +
-    `Renew now to keep your access!\n\n` +
-    `Reply *RENEW* to renew.`;
+    `Your *${plan?.name}* subscription expires in ${daysRemaining} day${daysRemaining > 1 ? 's' : ''}.` 
+   
 
   await sendTextMessage(phoneNumber, message);
   logger.info('Expiry reminder sent', { phoneNumber, planId, daysRemaining });
@@ -216,7 +235,7 @@ export const getSubscriptions = async (
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
-      include: { user: true, group: true },
+      include: { user: true },
     }),
     prisma.subscription.count({ where }),
   ]);
@@ -245,7 +264,11 @@ export const extendSubscription = async (
     throw new Error('Subscription not found');
   }
 
-  const newExpiryDate = new Date(subscription.expiryDate);
+  // Extend from the later of (current expiry, now). If the sub already lapsed,
+  // adding days to a past expiryDate would still leave it in the past — the
+  // cron would immediately re-grace/expire it and the "extension" would no-op.
+  const base = subscription.expiryDate > new Date() ? subscription.expiryDate : new Date();
+  const newExpiryDate = new Date(base);
   newExpiryDate.setDate(newExpiryDate.getDate() + days);
 
   const updated = await prisma.subscription.update({

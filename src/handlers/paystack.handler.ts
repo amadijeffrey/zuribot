@@ -7,54 +7,51 @@ import { logger } from '../utils/logger';
 
 export const handlePaystackWebhook = async (req: Request, res: Response): Promise<void> => {
   const signature = req.headers['x-paystack-signature'] as string;
+  const signatureValid = verifySignature(req, signature);
 
-  if (!verifySignature(req.body, signature)) {
-    logger.error('Invalid Paystack webhook signature');
+  // Persist the inbound event BEFORE acking and BEFORE returning on bad
+  // signature, so we always have an audit trail / replay source — even
+  // for events we reject (a real Paystack outage + signature mismatch
+  // would otherwise vanish silently, as happened during the prior bug).
+  const log = env.ENABLE_WEBHOOK_LOGGING
+    ? await prisma.webhookLog.create({
+        data: {
+          source: 'paystack',
+          eventType: req.body?.event ?? 'unknown',
+          payload: req.body,
+          processed: false,
+          error: signatureValid ? null : 'signature_invalid',
+        },
+      })
+    : null;
+
+  if (!signatureValid) {
+    logger.error('Invalid Paystack webhook signature', { webhookLogId: log?.id });
     res.status(401).json({ error: 'Invalid signature' });
     return;
   }
 
-  // Respond quickly to acknowledge receipt
   res.status(200).send('OK');
 
   try {
-    // Log webhook if enabled
-    if (env.ENABLE_WEBHOOK_LOGGING) {
-      await prisma.webhookLog.create({
-        data: {
-          source: 'paystack',
-          eventType: req.body.event,
-          payload: req.body,
-          processed: false,
-        },
-      });
-    }
-
-    // Process the webhook event
     await processWebhookEvent(req.body);
 
-    // Mark as processed
-    if (env.ENABLE_WEBHOOK_LOGGING) {
-      await prisma.webhookLog.updateMany({
-        where: {
-          source: 'paystack',
-          payload: { equals: req.body },
-        },
+    if (log) {
+      await prisma.webhookLog.update({
+        where: { id: log.id },
         data: { processed: true },
       });
     }
   } catch (error: any) {
     logger.error('Error processing Paystack webhook', {
       error: error.message,
-      event: req.body.event,
+      event: req.body?.event,
+      webhookLogId: log?.id,
     });
 
-    if (env.ENABLE_WEBHOOK_LOGGING) {
-      await prisma.webhookLog.updateMany({
-        where: {
-          source: 'paystack',
-          payload: { equals: req.body },
-        },
+    if (log) {
+      await prisma.webhookLog.update({
+        where: { id: log.id },
         data: { error: error.message },
       });
     }
@@ -78,12 +75,12 @@ export const handleVerifyPayment = async (req: Request, res: Response): Promise<
   }
 };
 
-const verifySignature = (body: any, signature: string): boolean => {
-  if (!signature) return false;
+const verifySignature = (req: Request, signature: string): boolean => {
+  if (!signature || !req.rawBody) return false;
 
   const hash = crypto
     .createHmac('sha512', env.PAYSTACK_SECRET_KEY)
-    .update(JSON.stringify(body))
+    .update(req.rawBody)
     .digest('hex');
 
   return hash === signature;

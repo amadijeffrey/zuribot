@@ -24,28 +24,31 @@ export const verifyWebhook = (req: Request, res: Response): void => {
 };
 
 export const handleWebhook = async (req: Request, res: Response): Promise<void> => {
+  const signatureValid = verifySignature(req);
+  const body = req.body;
+
+  // Persist the inbound event BEFORE acking and BEFORE bailing on bad
+  // signature — preserves an audit trail / replay source for any event
+  // we silently drop.
+  const log = env.ENABLE_WEBHOOK_LOGGING
+    ? await prisma.webhookLog.create({
+        data: {
+          source: 'whatsapp',
+          eventType: body?.entry?.[0]?.changes?.[0]?.field || 'unknown',
+          payload: body,
+          processed: false,
+          error: signatureValid ? null : 'signature_invalid',
+        },
+      })
+    : null;
+
   // IMPORTANT: Always respond with 200 quickly to prevent webhook retries
   res.status(200).send('EVENT_RECEIVED');
 
   try {
-    // Verify request signature
-    if (!verifySignature(req)) {
-      logger.error('Invalid webhook signature');
+    if (!signatureValid) {
+      logger.error('Invalid webhook signature', { webhookLogId: log?.id });
       return;
-    }
-
-    const body = req.body;
-
-    // Log webhook if enabled
-    if (env.ENABLE_WEBHOOK_LOGGING) {
-      await prisma.webhookLog.create({
-        data: {
-          source: 'whatsapp',
-          eventType: body.entry?.[0]?.changes?.[0]?.field || 'unknown',
-          payload: body,
-          processed: false,
-        },
-      });
     }
 
     // Check if this is a WhatsApp message webhook
@@ -90,21 +93,34 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
         }
       }
     }
-  } catch (error) {
-    logger.error('Error processing webhook', { error });
+
+    if (log) {
+      await prisma.webhookLog.update({
+        where: { id: log.id },
+        data: { processed: true },
+      });
+    }
+  } catch (error: any) {
+    logger.error('Error processing webhook', { error, webhookLogId: log?.id });
+    if (log) {
+      await prisma.webhookLog.update({
+        where: { id: log.id },
+        data: { error: error?.message || 'unknown' },
+      });
+    }
   }
 };
 
 const verifySignature = (req: Request): boolean => {
   const signature = req.headers['x-hub-signature-256'] as string;
 
-  if (!signature) {
+  if (!signature || !req.rawBody) {
     return false;
   }
 
   const expectedSignature = crypto
     .createHmac('sha256', env.WHATSAPP_APP_SECRET)
-    .update(JSON.stringify(req.body))
+    .update(req.rawBody)
     .digest('hex');
 
   const expectedHeader = `sha256=${expectedSignature}`;

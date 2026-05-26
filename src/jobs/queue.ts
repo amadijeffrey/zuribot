@@ -17,18 +17,18 @@ export const messageQueue = new Queue('messages', {
 });
 
 // Notification queue
-export const notificationQueue = new Queue('notifications', {
-  connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 5,
-    backoff: {
-      type: 'exponential',
-      delay: 2000,
-    },
-    removeOnComplete: 1000,
-    removeOnFail: 5000,
-  },
-});
+// export const notificationQueue = new Queue('notifications', {
+//   connection: redisConnection,
+//   defaultJobOptions: {
+//     attempts: 5,
+//     backoff: {
+//       type: 'exponential',
+//       delay: 2000,
+//     },
+//     removeOnComplete: 1000,
+//     removeOnFail: 5000,
+//   },
+// });
 
 // Queue events for monitoring
 const messageQueueEvents = new QueueEvents('messages', {
@@ -46,6 +46,6 @@ messageQueueEvents.on('failed', ({ jobId, failedReason }) => {
 // Graceful shutdown
 export const closeQueues = async (): Promise<void> => {
   await messageQueue.close();
-  await notificationQueue.close();
+  
   logger.info('All queues closed');
 };

@@ -8,6 +8,7 @@ import {
   moveToGracePeriod,
 } from '../services/subscription';
 import { sendTextMessage, sendCtaUrlMessage } from '../services/whatsapp';
+import { SUBSCRIPTION_PLANS } from '../config/constants';
 import { logger } from '../utils/logger';
 
 export const getUsers = async (req: Request, res: Response): Promise<void> => {
@@ -39,7 +40,7 @@ export const getUser = async (req: Request, res: Response): Promise<void> => {
   const user = await prisma.user.findUnique({
     where: { id },
     include: {
-      subscriptions: { orderBy: { createdAt: 'desc' }, include: { group: true } },
+      subscriptions: { orderBy: { createdAt: 'desc' } },
       payments: { orderBy: { createdAt: 'desc' } },
     },
   });
@@ -106,20 +107,17 @@ export const resendGroupLink = async (req: Request, res: Response): Promise<void
     return;
   }
 
-  const group = await prisma.group.findUnique({
-    where: { planId: subscription.planId },
-  });
-
-  if (!group) {
-    res.status(400).json({ error: 'Group not found for this plan' });
+  const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
+  if (!plan?.inviteLink) {
+    res.status(400).json({ error: 'No invite link configured for this plan' });
     return;
   }
 
   await sendCtaUrlMessage(
     user.phoneNumber,
-    `Tap the button below to join your exclusive group.`,
+    `Tap the button below to join your exclusive *${plan.name}* group.`,
     'Join the group',
-    group.inviteLink,
+    plan.inviteLink,
     'This link is exclusive to your subscription.'
   );
 
@@ -232,44 +230,6 @@ export const broadcast = async (req: Request, res: Response): Promise<void> => {
 
   logger.info('Broadcast completed', { sent, failed, filter });
   res.json({ success: true, sent, failed, total: uniqueUsers.length });
-};
-
-export const getGroups = async (_req: Request, res: Response): Promise<void> => {
-  const groups = await prisma.group.findMany({
-    include: { _count: { select: { subscriptions: true } } },
-  });
-  res.json(groups);
-};
-
-export const createGroup = async (req: Request, res: Response): Promise<void> => {
-  const { planId, name, inviteLink } = req.body;
-
-  if (!planId || !name || !inviteLink) {
-    res.status(400).json({ error: 'planId, name, and inviteLink are required' });
-    return;
-  }
-
-  const group = await prisma.group.create({
-    data: { planId, name, inviteLink },
-  });
-
-  res.status(201).json(group);
-};
-
-export const updateGroup = async (req: Request, res: Response): Promise<void> => {
-  const { id } = req.params;
-  const { name, inviteLink, isActive } = req.body;
-
-  const group = await prisma.group.update({
-    where: { id },
-    data: {
-      ...(name && { name }),
-      ...(inviteLink && { inviteLink }),
-      ...(typeof isActive === 'boolean' && { isActive }),
-    },
-  });
-
-  res.json(group);
 };
 
 export const getPayments = async (req: Request, res: Response): Promise<void> => {

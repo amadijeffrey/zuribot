@@ -23,10 +23,10 @@ export const SUBSCRIPTION_PLANS = {
   },
    test: {
     id: 'test',
-    name: 'Test Plan',
+    name: 'ZCN Test Plan',
     keywords: ['JOIN TEST', 'TEST'],
     amount: 200000,
-    paystackPlanCode: 'PLN_ld1nxnyx6xbxl3v',
+    paystackPlanCode: 'PLN_xt19zozmdq0w0ja',
     durationDays: 1 / 24,
     inviteLink: 'https://chat.whatsapp.com/CSSdJsiVmCLIZjW87ySMBX?mode=hqctcli',
     description: 'Access to Test tips and exclusive group',

@@ -23,11 +23,6 @@ router.post('/subscriptions/:id/simulate-payment-failed', adminHandler.simulateP
 // Payments
 router.get('/payments', adminHandler.getPayments);
 
-// Groups
-router.get('/groups', adminHandler.getGroups);
-router.post('/groups', adminHandler.createGroup);
-router.put('/groups/:id', adminHandler.updateGroup);
-
 // Stats & Broadcast
 router.get('/stats', adminHandler.getStats);
 router.post('/broadcast', adminHandler.broadcast);

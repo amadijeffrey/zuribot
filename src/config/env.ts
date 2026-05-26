@@ -23,7 +23,6 @@ const envSchema = z.object({
   PAYSTACK_WEALTH_PLAN_CODE: z.string().min(1),
   PAYSTACK_HEALTH_PLAN_CODE: z.string().min(1),
   PAYSTACK_BOOST_PLAN_CODE: z.string().min(1),
-  PAYSTACK_PREMIUM_PLAN_CODE: z.string().min(1),
 
   ADMIN_API_KEY: z.string(),
 

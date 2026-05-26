@@ -38,7 +38,6 @@ export const getUserById = async (id: string) => {
     include: {
       subscriptions: {
         orderBy: { createdAt: 'desc' },
-        include: { group: true },
       },
       payments: {
         orderBy: { createdAt: 'desc' },
@@ -53,7 +52,6 @@ export const getUserByPhoneNumber = async (phoneNumber: string) => {
     include: {
       subscriptions: {
         orderBy: { createdAt: 'desc' },
-        include: { group: true },
       },
       payments: {
         orderBy: { createdAt: 'desc' },
