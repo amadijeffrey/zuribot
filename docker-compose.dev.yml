@@ -1,0 +1,50 @@
+# Local development override. Used with the base compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# (Or just run ./scripts/dev.sh)
+#
+# Differences vs production:
+#   • Adds a local Postgres container (no Supabase dependency)
+#   • Overrides DATABASE_URL / DIRECT_URL to point at it
+#   • Exposes app on 127.0.0.1:3000 so you can curl it directly
+#   • Caddy uses `tls internal` (local CA) and serves https://localhost
+
+services:
+  app:
+    environment:
+      DATABASE_URL: postgresql://zuribot:zuribot@db:5432/zuribot?schema=public&connection_limit=15&pool_timeout=20
+      DIRECT_URL: postgresql://zuribot:zuribot@db:5432/zuribot
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  caddy:
+    environment:
+      DOMAIN: localhost
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: zuribot
+      POSTGRES_USER: zuribot
+      POSTGRES_PASSWORD: zuribot
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zuribot -d zuribot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - zuribot-network
+
+volumes:
+  postgres_dev_data:

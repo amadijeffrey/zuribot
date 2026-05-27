@@ -77,8 +77,7 @@ export const expireSubscription = async (subscriptionId: string): Promise<void> 
 export const getExpiredSubscriptions = async () => {
   const now = new Date();
   // For recurring subs, give the renewal webhook a 24h buffer to arrive before
-  // we treat the sub as expired. The webhook is the primary path; this cron is
-  // the safety net for missed deliveries (Paystack outage, our downtime, etc.).
+  // we treat the sub as expired.
   const recurringBuffer = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   return prisma.subscription.findMany({
@@ -265,8 +264,7 @@ export const extendSubscription = async (
   }
 
   // Extend from the later of (current expiry, now). If the sub already lapsed,
-  // adding days to a past expiryDate would still leave it in the past — the
-  // cron would immediately re-grace/expire it and the "extension" would no-op.
+  // adding days to a past expiryDate would still leave it in the past.
   const base = subscription.expiryDate > new Date() ? subscription.expiryDate : new Date();
   const newExpiryDate = new Date(base);
   newExpiryDate.setDate(newExpiryDate.getDate() + days);
