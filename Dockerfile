@@ -5,12 +5,14 @@ WORKDIR /app
 # Prisma needs OpenSSL to generate/run its query engine on Alpine.
 RUN apk add --no-cache openssl
 
+# Copy the Prisma schema before install so the `postinstall` hook
+# (prisma generate) can find it during `npm ci`.
 COPY package*.json ./
+COPY prisma ./prisma
 RUN npm ci
 
 COPY . .
 
-RUN npx prisma generate
 RUN npm run build
 
 # Production image

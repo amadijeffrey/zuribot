@@ -95,9 +95,20 @@ model MessageLog {
   messageId   String?  @map("message_id")
   status      String?  @map("status")
   createdAt   DateTime @default(now()) @map("created_at")
-  
+
   @@index([phoneNumber, createdAt])
   @@map("message_logs")
+}
+
+// Idempotency ledger for inbound WhatsApp messages. A row is written only
+// AFTER a message is fully processed, so retried/at-least-once redeliveries
+// of the same messageId are skipped while failed attempts (no row) retry.
+model ProcessedMessage {
+  id          String   @id @default(uuid())
+  messageId   String   @unique @map("message_id")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@map("processed_messages")
 }
 
 enum SubscriptionStatus {

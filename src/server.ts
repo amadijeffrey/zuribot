@@ -1,9 +1,6 @@
 import app from './app';
 import { env } from './config/env';
 import { prisma } from './config/database';
-import { redisConnection } from './config/redis';
-import { closeQueues } from './jobs/queue';
-import { messageWorker, closeMessageWorker } from './jobs/workers/message.worker';
 import { logger } from './utils/logger';
 
 const startServer = async () => {
@@ -11,17 +8,6 @@ const startServer = async () => {
     // Test database connection
     await prisma.$connect();
     logger.info('Database connected');
-
-    // Test Redis connection
-    await redisConnection.ping();
-    logger.info('Redis connected');
-
-    // BullMQ workers run in-process alongside the HTTP server. Importing the
-    // modules above instantiates them; log here so it's visible in startup.
-    logger.info('Workers started', {
-      message: messageWorker.isRunning(),
-  
-    });
 
     // Start server
     const server = app.listen(env.PORT, () => {
@@ -39,11 +25,7 @@ const startServer = async () => {
         logger.info('HTTP server closed');
 
         try {
-          await closeMessageWorker();
-      
-          await closeQueues();
           await prisma.$disconnect();
-          await redisConnection.quit();
           logger.info('All connections closed');
           process.exit(0);
         } catch (error) {

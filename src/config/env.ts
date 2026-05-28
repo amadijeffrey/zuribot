@@ -9,8 +9,7 @@ const envSchema = z.object({
   API_BASE_URL: z.string().url(),
   
   DATABASE_URL: z.string(),
-  REDIS_URL: z.string(),
-  
+
   WHATSAPP_API_VERSION: z.string().default('v18.0'),
   WHATSAPP_PHONE_NUMBER_ID: z.string(),
   WHATSAPP_BUSINESS_ACCOUNT_ID: z.string(),

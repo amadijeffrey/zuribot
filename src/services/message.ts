@@ -18,39 +18,51 @@ export const processMessage = async (context: MessageContext): Promise<void> => 
   const phoneNumber = message.from;
   const profileName = contact?.profile?.name || 'User';
 
-  try {
-    if (env.ENABLE_MESSAGE_LOGGING) {
-      await logMessage(phoneNumber, 'incoming', message);
-    }
-
-    const user = await getOrCreateUser({
+  // Idempotency guard. WhatsApp delivery is at-least-once and the webhook
+  // relies on retries (it returns non-200 on failure), so the same message.id
+  // can arrive more than once. Skip anything we've already fully processed.
+  const seen = await prisma.processedMessage.findUnique({
+    where: { messageId: message.id },
+  });
+  if (seen) {
+    logger.info('Skipping already-processed message', {
+      messageId: message.id,
       phoneNumber,
-      name: profileName,
     });
-
-    switch (message.type) {
-      case 'text':
-        await handleTextMessage(user, message.text?.body || '');
-        break;
-
-      case 'interactive':
-        await handleInteractiveMessage(user, message);
-        break;
-
-      case 'button':
-        await handleButtonMessage(user, message);
-        break;
-
-      default:
-        await handleUnsupportedMessage(user.phoneNumber);
-    }
-  } catch (error) {
-    logger.error('Error processing message', { phoneNumber, error });
-    await sendTextMessage(
-      phoneNumber,
-      'Sorry, something went wrong. Please try again later.'
-    );
+    return;
   }
+
+  if (env.ENABLE_MESSAGE_LOGGING) {
+    await logMessage(phoneNumber, 'incoming', message);
+  }
+
+  const user = await getOrCreateUser({
+    phoneNumber,
+    name: profileName,
+  });
+
+  switch (message.type) {
+    case 'text':
+      await handleTextMessage(user, message.text?.body || '');
+      break;
+
+    case 'interactive':
+      await handleInteractiveMessage(user, message);
+      break;
+
+    case 'button':
+      await handleButtonMessage(user, message);
+      break;
+
+    default:
+      await handleUnsupportedMessage(user.phoneNumber);
+  }
+
+  // Record only after every side effect above succeeded. A throw before this
+  // point leaves no row, so the webhook returns non-200 and WhatsApp retries.
+  await prisma.processedMessage.create({
+    data: { messageId: message.id },
+  });
 };
 
 const handleTextMessage = async (user: any, text: string): Promise<void> => {

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # Local development wrapper around docker compose. Brings up the full stack
-# (app + in-process workers, redis, caddy) plus a local Postgres, then applies the Prisma
+# (app, caddy) plus a local Postgres, then applies the Prisma
 # schema. Run from the repo root:
 #
 #   ./scripts/dev.sh            # bring up + push schema (default: 'up')
 #   ./scripts/dev.sh logs       # tail all service logs
 #   ./scripts/dev.sh down       # stop and remove containers (keeps volumes)
-#   ./scripts/dev.sh reset      # stop and DELETE local db / redis / caddy data
+#   ./scripts/dev.sh reset      # stop and DELETE local db / caddy data
 #   ./scripts/dev.sh seed       # run db:seed inside the app container
 #   ./scripts/dev.sh <anything> # passed through to docker compose
 
@@ -67,7 +67,7 @@ EOF
     ;;
 
   reset)
-    warn "this deletes local Postgres data, Redis AOF, and Caddy certs"
+    warn "this deletes local Postgres data and Caddy certs"
     read -r -p "continue? [y/N] " ans
     [[ "$ans" == "y" || "$ans" == "Y" ]] || exit 0
     "${COMPOSE[@]}" down -v

@@ -2,9 +2,8 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { env } from '../config/env';
 import { prisma } from '../config/database';
-import { messageQueue } from '../jobs/queue';
 import { logger } from '../utils/logger';
-import { updateMessageStatus } from '../services/message';
+import { processMessage, updateMessageStatus } from '../services/message';
 
 export const verifyWebhook = (req: Request, res: Response): void => {
   const mode = req.query['hub.mode'];
@@ -27,9 +26,7 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
   const signatureValid = verifySignature(req);
   const body = req.body;
 
-  // Persist the inbound event BEFORE acking and BEFORE bailing on bad
-  // signature — preserves an audit trail / replay source for any event
-  // we silently drop.
+  // Persist the inbound event up front as an audit trail / replay source.
   const log = env.ENABLE_WEBHOOK_LOGGING
     ? await prisma.webhookLog.create({
         data: {
@@ -42,22 +39,26 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
       })
     : null;
 
-  // IMPORTANT: Always respond with 200 quickly to prevent webhook retries
-  res.status(200).send('EVENT_RECEIVED');
+  // Invalid signature and unknown object type are permanent conditions — a
+  // retry would always fail the same way. Ack with 200 so WhatsApp stops
+  // resending, and drop (the event is already logged above).
+  if (!signatureValid) {
+    logger.error('Invalid webhook signature', { webhookLogId: log?.id });
+    res.status(200).send('EVENT_RECEIVED');
+    return;
+  }
 
+  if (body.object !== 'whatsapp_business_account') {
+    logger.warn('Unknown webhook object type', { object: body.object });
+    res.status(200).send('EVENT_RECEIVED');
+    return;
+  }
+
+  // ACK-AFTER: process synchronously, then ack. If anything throws we return
+  // 500 so WhatsApp retries the whole payload. The message.id dedup guard in
+  // processMessage makes the replay safe — already-processed messages are
+  // skipped, only the failed one re-runs.
   try {
-    if (!signatureValid) {
-      logger.error('Invalid webhook signature', { webhookLogId: log?.id });
-      return;
-    }
-
-    // Check if this is a WhatsApp message webhook
-    if (body.object !== 'whatsapp_business_account') {
-      logger.warn('Unknown webhook object type', { object: body.object });
-      return;
-    }
-
-    // Process entries
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         if (change.field !== 'messages') continue;
@@ -67,27 +68,12 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
         const messages = value.messages || [];
         const statuses = value.statuses || [];
 
-        // Process incoming messages - queue for async processing
         for (const message of messages) {
           const contact = contacts.find((c: any) => c.wa_id === message.from);
-
-          await messageQueue.add('process-message', {
-            message,
-            contact,
-            timestamp: new Date().toISOString(),
-          }, {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 1000 },
-          });
-
-          logger.info('Message queued for processing', {
-            messageId: message.id,
-            from: message.from,
-            type: message.type,
-          });
+          await processMessage({ message, contact });
         }
 
-        // Process status updates (sent, delivered, read)
+        // Status updates (sent, delivered, read) — idempotent updateMany.
         for (const status of statuses) {
           await updateMessageStatus(status.id, status.status);
         }
@@ -100,14 +86,20 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
         data: { processed: true },
       });
     }
+
+    res.status(200).send('EVENT_RECEIVED');
   } catch (error: any) {
-    logger.error('Error processing webhook', { error, webhookLogId: log?.id });
+    logger.error('Error processing webhook — returning 500 for WhatsApp retry', {
+      error,
+      webhookLogId: log?.id,
+    });
     if (log) {
       await prisma.webhookLog.update({
         where: { id: log.id },
         data: { error: error?.message || 'unknown' },
       });
     }
+    res.status(500).send('PROCESSING_FAILED');
   }
 };
 

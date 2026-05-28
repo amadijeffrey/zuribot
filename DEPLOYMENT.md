@@ -1,8 +1,8 @@
 # ZuriBot — VM Deployment Guide
 
-Deploy ZuriBot (Node.js API with in-process BullMQ workers + Redis + Caddy) onto a single Linux VM using Docker Compose, with **PostgreSQL hosted on Supabase**. Tested on **Ubuntu 22.04 LTS** on Hetzner Cloud and DigitalOcean.
+Deploy ZuriBot (Node.js API + Caddy) onto a single Linux VM using Docker Compose, with **PostgreSQL hosted on Supabase**. Tested on **Ubuntu 22.04 LTS** on Hetzner Cloud and DigitalOcean.
 
-On the VM: `app`, `redis`, `caddy`. Postgres lives in Supabase (managed). Caddy terminates TLS and proxies to the app on the Docker network — `app` and `redis` have no host port bindings.
+On the VM: `app`, `caddy`. Postgres lives in Supabase (managed). Caddy terminates TLS and proxies to the app on the Docker network — `app` has no host port binding.
 
 ---
 
@@ -199,9 +199,8 @@ docker compose up -d --force-recreate app
 # Reload Caddy after editing Caddyfile
 docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
 
-# Shells
+# Shell
 docker compose exec app sh
-docker compose exec redis redis-cli
 
 # psql against Supabase
 docker run --rm -it postgres:15-alpine psql "$DIRECT_URL"
@@ -247,7 +246,7 @@ Enable scheduled snapshots in Hetzner/DO — cheap insurance for the whole disk.
 - [ ] `.env` is `chmod 600` (`setup.sh` enforces this).
 - [ ] Supabase password is strong, Network Restrictions allow-list contains only the VM IP.
 - [ ] `ADMIN_API_KEY` is a random 32-byte value (`openssl rand -hex 32`), not the default.
-- [ ] `docker compose ps` shows host bindings only on `caddy` (80, 443) — never on `app` or `redis`.
+- [ ] `docker compose ps` shows host bindings only on `caddy` (80, 443) — never on `app`.
 - [ ] TLS works (`curl -I https://yourdomain.com`).
 - [ ] Webhooks in Meta + Paystack point to the HTTPS domain.
 - [ ] Fail2ban active (`sudo fail2ban-client status sshd`).
@@ -301,7 +300,7 @@ What this does (via [docker-compose.dev.yml](docker-compose.dev.yml)):
 ./scripts/dev.sh logs app  # tail one service
 ./scripts/dev.sh seed      # run db:seed
 ./scripts/dev.sh down      # stop containers (keep data)
-./scripts/dev.sh reset     # stop AND delete db + redis + caddy volumes
+./scripts/dev.sh reset     # stop AND delete db + caddy volumes
 ```
 
 Any subcommand the wrapper doesn't recognise gets passed through to `docker compose`, e.g. `./scripts/dev.sh exec app sh`.
@@ -325,8 +324,7 @@ You only need to do this once per machine.
 
 ## Appendix — When to graduate off this setup
 
-This layout (one small VM + managed Postgres) comfortably handles a single-tenant WhatsApp gateway. Likely upgrade triggers, in order:
+This layout (one small VM + managed Postgres) comfortably handles a single-tenant WhatsApp gateway. Webhooks are processed synchronously in-process and acked after success, so WhatsApp's own retries cover transient failures. Likely upgrade triggers, in order:
 
-1. **Redis becomes a bottleneck or risks data loss** → move to Upstash / managed Redis.
-2. **Worker throughput is the limit** → scale the app (`docker compose up -d --scale app=3`); BullMQ coordinates job distribution via Redis. Or split workers back into a dedicated process.
-3. **App availability matters** → run two VMs behind the provider's load balancer.
+1. **Synchronous processing makes webhook responses too slow** (risking WhatsApp timeouts/duplicate deliveries) → reintroduce a job queue so the webhook can ack fast and process out-of-band.
+2. **App availability matters** → run two VMs behind the provider's load balancer.

@@ -87,11 +87,10 @@ fi
 info "Building images"
 docker compose build
 
-info "Starting stack (app, redis, caddy)"
+info "Starting stack (app, caddy)"
 docker compose up -d
 
-info "Waiting for services to become healthy"
-# Give redis healthcheck a moment, then show status
+info "Waiting for services to start"
 sleep 8
 docker compose ps
 
