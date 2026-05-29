@@ -31,8 +31,11 @@ export const handlePaystackWebhook = async (req: Request, res: Response): Promis
     return;
   }
 
-  res.status(200).send('OK');
-
+  // Process BEFORE responding. On serverless platforms (Vercel) the function
+  // is frozen/terminated once the response is flushed, so any async work kicked
+  // off after res.send() may never run — which previously left the webhook
+  // logged but the subscription never created. Paystack's delivery timeout is
+  // generous enough to await the work here.
   try {
     await processWebhookEvent(req.body);
 
@@ -56,6 +59,8 @@ export const handlePaystackWebhook = async (req: Request, res: Response): Promis
       });
     }
   }
+
+  res.status(200).send('OK');
 };
 
 export const handleVerifyPayment = async (req: Request, res: Response): Promise<void> => {
