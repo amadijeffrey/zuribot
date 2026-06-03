@@ -140,6 +140,10 @@ export const processWebhookEvent = async (event: any): Promise<void> => {
       await handleInvoiceCreated(event.data);
       break;
 
+    case 'invoice.update':
+      await handleInvoiceUpdate(event.data);
+      break;
+
     default:
       logger.info('Unhandled Paystack event', { event: event.event });
   }
@@ -388,9 +392,69 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
   await sendActivationConfirmation(payment.userId, payment.planId);
 };
 
+// charge.success for a Paystack-managed subscription. NOTE: in practice Paystack
+// usually omits the `subscription` object from recurring charge.success events —
+// the renewal is instead driven by invoice.update (see handleInvoiceUpdate). This
+// path is kept as a best-effort handler for the cases where the code IS present;
+// it shares applyRecurringRenewal so the two paths can't double-extend.
 const handleRecurringCharge = async (data: any): Promise<void> => {
-  const subscriptionCode = data.subscription.subscription_code;
+  await applyRecurringRenewal(data.subscription.subscription_code, {
+    reference: data.reference,
+    amount: Number(data.amount),
+    paidAt: data.paid_at,
+    authorizationCode: data.authorization?.authorization_code,
+    raw: data,
+  });
+};
 
+// invoice.update is Paystack's reliable signal that a recurring billing cycle
+// resolved. A successful one (paid + status:success) is what actually renews a
+// subscription, because the matching charge.success typically arrives WITHOUT
+// a subscription_code and so can't be linked on its own.
+const handleInvoiceUpdate = async (data: any): Promise<void> => {
+  const succeeded = data.paid === true || data.status === 'success';
+  if (!succeeded) {
+    // Failures are handled by invoice.payment_failed; nothing to do here.
+    logger.info('Ignoring non-successful invoice.update', {
+      status: data.status,
+      paid: data.paid,
+      invoiceCode: data.invoice_code,
+    });
+    return;
+  }
+
+  const subscriptionCode = data.subscription?.subscription_code;
+  if (!subscriptionCode) {
+    logger.warn('invoice.update success without subscription_code — skipping', {
+      invoiceCode: data.invoice_code,
+    });
+    return;
+  }
+
+  const txn = data.transaction ?? {};
+  await applyRecurringRenewal(subscriptionCode, {
+    reference: txn.reference,
+    amount: Number(txn.amount ?? data.amount),
+    paidAt: txn.paid_at ?? data.paid_at,
+    authorizationCode:
+      data.authorization?.authorization_code ?? txn.authorization?.authorization_code,
+    raw: data,
+  });
+};
+
+// Shared application of a successful recurring charge. Idempotent on the
+// transaction reference so the charge.success and invoice.update events for the
+// same renewal cannot extend the subscription twice.
+const applyRecurringRenewal = async (
+  subscriptionCode: string,
+  charge: {
+    reference?: string;
+    amount: number;
+    paidAt?: string;
+    authorizationCode?: string;
+    raw: any;
+  },
+): Promise<void> => {
   const subscription = await prisma.subscription.findFirst({
     where: { paystackSubscriptionCode: subscriptionCode },
   });
@@ -405,7 +469,7 @@ const handleRecurringCharge = async (data: any): Promise<void> => {
   // and re-bill the customer on a cycle they thought was over. Disable on
   // Paystack to stop future invoice attempts.
   if (subscription.status === 'CANCELLED') {
-    logger.warn('Recurring charge.success for CANCELLED subscription — not extending; disabling on Paystack', {
+    logger.warn('Recurring charge for CANCELLED subscription — not extending; disabling on Paystack', {
       subscriptionCode,
       subscriptionId: subscription.id,
     });
@@ -418,34 +482,55 @@ const handleRecurringCharge = async (data: any): Promise<void> => {
   const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
   if (!plan) return;
 
-  if (Number(data.amount) < plan.amount) {
+  if (Number(charge.amount) < plan.amount) {
     logger.error('ALERT: recurring charge amount below plan price — not extending subscription', {
       subscriptionCode,
       subscriptionId: subscription.id,
       expected: plan.amount,
-      received: data.amount,
+      received: charge.amount,
     });
     return;
   }
 
+  // Idempotency: if we've already recorded this transaction, don't extend again.
+  if (charge.reference) {
+    const existing = await prisma.payment.findUnique({ where: { reference: charge.reference } });
+    if (existing?.status === 'SUCCESS') {
+      logger.info('Recurring charge already processed, skipping', { reference: charge.reference });
+      return;
+    }
+  }
+
   await prisma.$transaction(async (tx) => {
-    const expiryDate = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
+    // Extend from the later of (current expiry, now) so a late-delivered webhook
+    // never loses already-paid time, and an early one doesn't grant extra.
+    const base = subscription.expiryDate > new Date() ? subscription.expiryDate : new Date();
+    const expiryDate = new Date(base.getTime() + plan.durationDays * 24 * 60 * 60 * 1000);
 
     const graceEndDate = new Date(expiryDate);
     graceEndDate.setDate(graceEndDate.getDate() + GRACE_PERIOD_DAYS);
 
-    const newPayment = await tx.payment.create({
-      data: {
-        userId: subscription.userId,
-        reference: data.reference,
-        amount: data.amount,
-        planId: subscription.planId,
-        status: 'SUCCESS',
-        paidAt: new Date(data.paid_at || Date.now()),
-        paystackData: data,
-        subscriptionId: subscription.id,
-      },
-    });
+    if (charge.reference) {
+      await tx.payment.upsert({
+        where: { reference: charge.reference },
+        update: {
+          status: 'SUCCESS',
+          paidAt: new Date(charge.paidAt || Date.now()),
+          paystackData: charge.raw,
+          subscriptionId: subscription.id,
+        },
+        create: {
+          userId: subscription.userId,
+          reference: charge.reference,
+          amount: charge.amount,
+          planId: subscription.planId,
+          status: 'SUCCESS',
+          paidAt: new Date(charge.paidAt || Date.now()),
+          paystackData: charge.raw,
+          subscriptionId: subscription.id,
+        },
+      });
+    }
 
     await tx.subscription.update({
       where: { id: subscription.id },
@@ -454,17 +539,19 @@ const handleRecurringCharge = async (data: any): Promise<void> => {
         expiryDate,
         graceEndDate,
         paystackAuthorizationCode:
-          data.authorization?.authorization_code ?? subscription.paystackAuthorizationCode,
+          charge.authorizationCode ?? subscription.paystackAuthorizationCode,
       },
     });
 
-    logger.info('Subscription renewed', {
+    logger.info('Subscription renewed (recurring)', {
       subscriptionCode,
-      paymentId: newPayment.id,
+      subscriptionId: subscription.id,
       userId: subscription.userId,
       expiryDate,
     });
   });
+
+  await sendRenewalConfirmation(subscription.userId, subscription.planId);
 };
 
 // --- manual renewal via stored authorization ---
