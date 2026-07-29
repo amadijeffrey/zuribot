@@ -4,6 +4,7 @@ import { prisma } from '../config/database';
 import { env } from '../config/env';
 import { SUBSCRIPTION_PLANS, GRACE_PERIOD_DAYS } from '../config/constants';
 import { sendActivationConfirmation, sendRenewalConfirmation, sendExpiryReminder, moveToGracePeriod, expireSubscription } from './subscription';
+import { sendActivationEmail, sendRenewalEmail } from './email';
 import { logger } from '../utils/logger';
 import { InitializePaymentParams, InitializePaymentResult } from '../types';
 
@@ -19,12 +20,19 @@ const paystackClient = axios.create({
 export const initializePayment = async (
   params: InitializePaymentParams
 ): Promise<InitializePaymentResult> => {
-  const { userId, planId, email } = params;
+  const { userId, planId, email, channel = 'WHATSAPP' } = params;
   const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
 
   if (!plan) throw new Error(`Unknown plan: ${planId}`);
 
   const reference = `SUB_${planId.toUpperCase()}_${uuidv4().slice(0, 8)}`;
+
+  // WEB payments send the user back to the frontend success page, which reads
+  // the reference and confirms via GET /users/registration-status.
+  const callbackUrl =
+    channel === 'WEB' && env.FRONTEND_URL
+      ? `${env.FRONTEND_URL.replace(/\/$/, '')}/payment/success?reference=${reference}`
+      : undefined;
 
   try {
     await prisma.payment.create({
@@ -34,6 +42,7 @@ export const initializePayment = async (
         amount: plan.amount,
         planId,
         status: 'PENDING',
+        channel,
       },
     });
 
@@ -52,7 +61,7 @@ export const initializePayment = async (
       email,
       amount: plan.amount,
       reference,
-      // callback_url: `${env.API_BASE_URL}/payment/callback`,
+      ...(callbackUrl ? { callback_url: callbackUrl } : {}),
       metadata: {
         userId,
         planId,
@@ -271,6 +280,39 @@ const disablePaystackSubscription = async (
   }
 };
 
+// Fetch the full subscription from Paystack. Needed on invoice.payment_failed
+// because Paystack does NOT include the decline reason in that webhook payload —
+// it lives on the subscription's `most_recent_invoice` object instead.
+const fetchPaystackSubscription = async (
+  subscriptionCode: string,
+): Promise<any | null> => {
+  try {
+    const { data: res } = await paystackClient.get(`/subscription/${subscriptionCode}`);
+    return res.data;
+  } catch (error: any) {
+    logger.error('Failed to fetch Paystack subscription', {
+      error: error.response?.data || error.message,
+      subscriptionCode,
+    });
+    return null;
+  }
+};
+
+// Channel-aware post-payment delivery. Keeps the WEB flow fully decoupled from
+// WhatsApp: WEB subscribers are notified (and receive the invite link) by email,
+// WHATSAPP subscribers by the bot as before.
+type Channel = 'WHATSAPP' | 'WEB';
+
+const deliverActivation = async (channel: Channel, userId: string, planId: string): Promise<void> => {
+  if (channel === 'WEB') await sendActivationEmail(userId, planId);
+  else await sendActivationConfirmation(userId, planId);
+};
+
+const deliverRenewal = async (channel: Channel, userId: string, planId: string): Promise<void> => {
+  if (channel === 'WEB') await sendRenewalEmail(userId, planId);
+  else await sendRenewalConfirmation(userId, planId);
+};
+
 const handleInitialPayment = async (reference: string, data: any): Promise<void> => {
   const payment = await prisma.payment.findUnique({
     where: { reference },
@@ -282,9 +324,7 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
     return;
   }
 
-  // Idempotency: webhook delivery + manual /payment/verify can both fire for
-  // the same reference. First caller flips status to SUCCESS; later callers
-  // no-op so we don't double-create the Subscription / double-bill on Paystack.
+  // Cheap fast-path for the common "already done" retry.
   if (payment.status === 'SUCCESS') {
     logger.info('Payment already processed — skipping initial activation', { reference });
     return;
@@ -293,8 +333,29 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
   const plan = SUBSCRIPTION_PLANS[payment.planId as keyof typeof SUBSCRIPTION_PLANS];
   if (!plan) throw new Error(`Plan not found: ${payment.planId}`);
 
+  // Concurrency gate. The webhook (charge.success) and the verify-on-demand path
+  // (GET /registration-status) can both reach here for the same reference at the
+  // same time. A read-then-check on status is a TOCTOU race — both would see
+  // PENDING and each create a Subscription. Instead, atomically flip PENDING→
+  // SUCCESS: exactly one caller gets count===1 and owns the activation; the rest
+  // no-op. This also stops the loser from making a duplicate createPaystackSubscription call.
+  const claim = await prisma.payment.updateMany({
+    where: { reference, status: 'PENDING' },
+    data: {
+      status: 'SUCCESS',
+      paidAt: new Date(data.paid_at || Date.now()),
+      paystackData: data,
+    },
+  });
+
+  if (claim.count === 0) {
+    logger.info('Payment already claimed by a concurrent handler — skipping activation', { reference });
+    return;
+  }
+
   // Trust Paystack as the source of truth for what was actually charged.
-  // Underpayments must NOT grant access — operator review required.
+  // Underpayments must NOT grant access — operator review required. The payment
+  // is already recorded as SUCCESS by the claim above; we just don't activate.
   if (Number(data.amount) < plan.amount) {
     logger.error('ALERT: charge amount below plan price — payment recorded, subscription NOT activated', {
       reference,
@@ -302,14 +363,6 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
       planId: payment.planId,
       expected: plan.amount,
       received: data.amount,
-    });
-    await prisma.payment.update({
-      where: { reference },
-      data: {
-        status: 'SUCCESS',
-        paidAt: new Date(data.paid_at || Date.now()),
-        paystackData: data,
-      },
     });
     return;
   }
@@ -332,15 +385,6 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
 
   try {
     await prisma.$transaction(async (tx) => {
-      await tx.payment.update({
-        where: { reference },
-        data: {
-          status: 'SUCCESS',
-          paidAt: new Date(data.paid_at || Date.now()),
-          paystackData: data,
-        },
-      });
-
       const startDate = new Date();
       const expiryDate = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
 
@@ -352,6 +396,7 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
           userId: payment.userId,
           planId: payment.planId,
           status: 'ACTIVE',
+          channel: payment.channel,
           startDate,
           expiryDate,
           graceEndDate,
@@ -375,6 +420,20 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
       });
     });
   } catch (err) {
+    // Activation failed after we claimed the payment. Revert the claim to PENDING
+    // (only if it hasn't been linked to a sub) so a later Paystack retry / verify
+    // can reprocess it instead of the payment being stuck SUCCESS with no sub.
+    logger.error('Activation failed after claim — reverting payment to PENDING', {
+      reference,
+      error: (err as Error).message,
+    });
+    await prisma.payment
+      .updateMany({
+        where: { reference, status: 'SUCCESS', subscriptionId: null },
+        data: { status: 'PENDING' },
+      })
+      .catch(() => {});
+
     // Compensation: we already created the Paystack subscription before the
     // DB transaction. If the tx failed, disable it on Paystack so the customer
     // isn't auto-billed against a sub we have no record of locally.
@@ -382,14 +441,13 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
       logger.error('DB transaction failed after Paystack subscription created — disabling on Paystack to avoid orphan billing', {
         reference,
         subscriptionCode: paystackSub.code,
-        error: (err as Error).message,
       });
       await disablePaystackSubscription(paystackSub.code, paystackSub.emailToken);
     }
     throw err;
   }
 
-  await sendActivationConfirmation(payment.userId, payment.planId);
+  await deliverActivation(payment.channel, payment.userId, payment.planId);
 };
 
 // charge.success for a Paystack-managed subscription. NOTE: in practice Paystack
@@ -412,6 +470,7 @@ const handleRecurringCharge = async (data: any): Promise<void> => {
 // subscription, because the matching charge.success typically arrives WITHOUT
 // a subscription_code and so can't be linked on its own.
 const handleInvoiceUpdate = async (data: any): Promise<void> => {
+  console.log(data, 'yyyyyyyyyyyyy')
   const succeeded = data.paid === true || data.status === 'success';
   if (!succeeded) {
     // Failures are handled by invoice.payment_failed; nothing to do here.
@@ -551,7 +610,7 @@ const applyRecurringRenewal = async (
     });
   });
 
-  await sendRenewalConfirmation(subscription.userId, subscription.planId);
+  await deliverRenewal(subscription.channel, subscription.userId, subscription.planId);
 };
 
 // --- manual renewal via stored authorization ---
@@ -616,7 +675,7 @@ const applyRenewalCharge = async (
   });
 
   const sub = await prisma.subscription.findUnique({ where: { id: subscriptionId } });
-  if (sub) await sendRenewalConfirmation(sub.userId, sub.planId);
+  if (sub) await deliverRenewal(sub.channel, sub.userId, sub.planId);
 };
 
 // Generates a Paystack payment link for renewing an EXISTING subscription
@@ -769,18 +828,33 @@ const handleInvoicePaymentFailed = async (data: any): Promise<void> => {
   // Insufficient-funds failures are transient — Paystack will auto-retry and a
   // future recurring charge.success will move this sub back to ACTIVE. Anything
   // else (card declined, expired, stolen, fraud, etc.) is treated as terminal.
-  const reason: string =
-    data.transaction?.gateway_response ?? data.transaction?.message ?? '';
+  //
+  // Paystack does NOT put the decline reason in the invoice.payment_failed
+  // payload, so fetch the subscription and read most_recent_invoice.description
+  // (e.g. "Insufficient funds", "Card expired", "Bank declined the transaction").
+  const paystackSub = await fetchPaystackSubscription(subscriptionCode);
+  const invoice = paystackSub?.most_recent_invoice;
+
+  console.log(invoice, 'TTTTTTTTTTTTTT', paystackSub)
+  const reason: string = invoice?.description ?? '';
   const isInsufficientFunds = /insufficient\s*funds?/i.test(reason);
+
+  // If we couldn't resolve the reason (fetch failed, or no description), default
+  // to the transient path: GRACE keeps access reversible while Paystack keeps
+  // retrying. Treating an unknown failure as terminal would wrongly disable the
+  // subscription and stop retries that might otherwise succeed.
+  const reasonResolved = reason.length > 0;
+  const treatAsTerminal = reasonResolved && !isInsufficientFunds;
 
   logger.info('Invoice payment failed', {
     subscriptionId: subscription.id,
     subscriptionCode,
-    reason,
-    nextAction: isInsufficientFunds ? 'GRACE' : 'EXPIRED',
+    reason: reason || '(unresolved)',
+    invoiceStatus: invoice?.status,
+    nextAction: treatAsTerminal ? 'EXPIRED' : 'GRACE',
   });
 
-  if (isInsufficientFunds) {
+  if (!treatAsTerminal) {
     await moveToGracePeriod(subscription.id);
   } else {
     if (subscription.paystackSubscriptionCode && subscription.paystackEmailToken) {

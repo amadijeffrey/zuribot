@@ -32,6 +32,19 @@ const envSchema = z.object({
   
   ENABLE_WEBHOOK_LOGGING: z.string().transform(v => v === 'true').default('true'),
   ENABLE_MESSAGE_LOGGING: z.string().transform(v => v === 'true').default('true'),
+
+  // Web registration flow. FRONTEND_URL is the base of the Next.js app; after a
+  // WEB payment Paystack redirects to `${FRONTEND_URL}/payment/success?reference=...`.
+  FRONTEND_URL: z.string().url().optional(),
+
+  // Email delivery (nodemailer / Gmail SMTP) — backup channel that sends the
+  // invite link to web registrants. Optional so the app still boots without it;
+  // the mailer no-ops with an error log when unconfigured.
+  SMTP_HOST: z.string().default('smtp.gmail.com'),
+  SMTP_PORT: z.string().transform(Number).default('465'),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  EMAIL_FROM: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);

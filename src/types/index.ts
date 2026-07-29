@@ -4,6 +4,9 @@ export interface InitializePaymentParams {
   userId: string;
   planId: string;
   email: string;
+  // Origination channel. Defaults to WHATSAPP; WEB adds a Paystack redirect
+  // (callback_url) and routes post-payment delivery through email, not WhatsApp.
+  channel?: 'WHATSAPP' | 'WEB';
 }
 
 export interface InitializePaymentResult {

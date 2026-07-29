@@ -4,6 +4,7 @@ import { logger } from '../utils/logger';
 import webhookRoutes from './webhook.routes';
 import paystackRoutes from './paystack.routes';
 import adminRoutes from './admin.routes';
+import userRoutes from './users.routes';
 
 const router = Router();
 
@@ -35,6 +36,7 @@ router.get('/ready', async (_req, res) => {
 
 router.use('/', webhookRoutes);
 router.use('/', paystackRoutes);
-router.use('/admin', adminRoutes);
+router.use('/api/admin', adminRoutes);
+router.use('/api/users', userRoutes);
 
 export default router;

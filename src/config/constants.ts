@@ -17,7 +17,7 @@ export const SUBSCRIPTION_PLANS = {
     keywords: ['JOIN HEALTH', 'HEALTH'],
     amount: env.HEALTH_PLAN_AMOUNT,
     paystackPlanCode: env.PAYSTACK_HEALTH_PLAN_CODE,
-    durationDays: 1,
+    durationDays: 1 / 24,
     inviteLink: 'https://chat.whatsapp.com/JcCTGFHk5qD0SBBg5vPu2D?s=sh&p=a&ilr=1',
     description: 'Access to Health tips and exclusive group',
   },

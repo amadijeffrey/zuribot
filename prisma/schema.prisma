@@ -29,6 +29,7 @@ model Subscription {
   userId        String             @map("user_id")
   planId        String             @map("plan_id")
   status        SubscriptionStatus @default(ACTIVE)
+  channel       PaymentChannel     @default(WHATSAPP)
   startDate     DateTime           @map("start_date")
   expiryDate    DateTime           @map("expiry_date")
   graceEndDate  DateTime?          @map("grace_end_date")
@@ -56,6 +57,7 @@ model Payment {
   amount          Int           @map("amount")
   currency        String        @default("NGN") @map("currency")
   status          PaymentStatus @default(PENDING) @map("status")
+  channel         PaymentChannel @default(WHATSAPP)
   planId          String        @map("plan_id")
   paystackData    Json?         @map("paystack_data")
   paidAt          DateTime?     @map("paid_at")
@@ -122,4 +124,12 @@ enum PaymentStatus {
   PENDING
   SUCCESS
   FAILED
+}
+
+// How a subscription/payment was originated. Drives post-payment delivery:
+// WHATSAPP → bot confirmation message; WEB → email + frontend redirect (no
+// WhatsApp messaging).
+enum PaymentChannel {
+  WHATSAPP
+  WEB
 }
