@@ -3,6 +3,12 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// An env var written as `KEY=` arrives as an empty string, and zod's .default()
+// only applies to a MISSING key — so the empty value would pass straight through
+// to consumers. Treating '' as absent makes `KEY=` behave like `KEY` unset.
+const optional = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((v) => (v === '' ? undefined : v), schema);
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform(Number).default('3000'),
@@ -18,33 +24,30 @@ const envSchema = z.object({
   
   PAYSTACK_SECRET_KEY: z.string(),
   PAYSTACK_PUBLIC_KEY: z.string(),
-  PAYSTACK_WEALTH_PLAN_CODE: z.string().min(1),
-  PAYSTACK_HEALTH_PLAN_CODE: z.string().min(1),
-  PAYSTACK_BOOST_PLAN_CODE: z.string().optional(),
 
   ADMIN_API_KEY: z.string(),
+  JWT_SECRET: optional(z.string().min(32).optional()),
+  JWT_EXPIRES_IN: optional(z.string().min(1).default('2h')),
+  CRON_SECRET: optional(z.string().optional()),
 
-  WEALTH_PLAN_AMOUNT: z.string().transform(Number).default('500000'),
-  HEALTH_PLAN_AMOUNT: z.string().transform(Number).default('500000'),
-  // BOOST_PLAN_AMOUNT: z.string().transform(Number).default('1000000'),
-  // PREMIUM_PLAN_AMOUNT: z.string().transform(Number).default('2500000'),
+
   GRACE_PERIOD_DAYS: z.string().transform(Number).default('3'),
   
+  // WhatsApp outbound messaging. Off by default: the product now delivers over
+  // email, and the bot's send functions are kept only so the flow can be revived
+  // by flipping this back on. Inbound bot webhooks are unaffected.
+  ENABLE_WHATSAPP_NOTIFICATIONS: z.string().transform(v => v === 'true').default('false'),
+
   ENABLE_WEBHOOK_LOGGING: z.string().transform(v => v === 'true').default('true'),
   ENABLE_MESSAGE_LOGGING: z.string().transform(v => v === 'true').default('true'),
+  // Comma-separated browser origins allowed to call the API. Validated here so a
+  // missing value is visible in config rather than silently blocking every
+  // browser request at runtime.
+  ALLOWED_ORIGINS: z.string().default(''),
 
-  // Web registration flow. FRONTEND_URL is the base of the Next.js app; after a
-  // WEB payment Paystack redirects to `${FRONTEND_URL}/payment/success?reference=...`.
-  FRONTEND_URL: z.string().url().optional(),
-
-  // Email delivery (nodemailer / Gmail SMTP) — backup channel that sends the
-  // invite link to web registrants. Optional so the app still boots without it;
-  // the mailer no-ops with an error log when unconfigured.
-  SMTP_HOST: z.string().default('smtp.gmail.com'),
-  SMTP_PORT: z.string().transform(Number).default('465'),
-  SMTP_USER: z.string().optional(),
-  SMTP_PASS: z.string().optional(),
-  EMAIL_FROM: z.string().optional(),
+  FRONTEND_URL: optional(z.string().url().optional()),
+  RESEND_API_KEY: optional(z.string().optional()),
+  EMAIL_FROM: optional(z.string().optional()),
 });
 
 export const env = envSchema.parse(process.env);

@@ -1,7 +1,14 @@
 import winston from 'winston';
 import { env } from '../config/env';
+import { redactInfoInPlace } from './redact';
+
+// Masks personal identifiers (emails, phone numbers, cardholder names) in log
+// metadata. Applied centrally rather than at each call site so new logging can't
+// reintroduce the leak.
+const redactPii = winston.format((info) => redactInfoInPlace(info as any));
 
 const logFormat = winston.format.combine(
+  redactPii(),
   winston.format.timestamp(),
   winston.format.errors({ stack: true }),
   winston.format.json()

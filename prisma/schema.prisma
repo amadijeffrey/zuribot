@@ -9,80 +9,242 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+// A member. Membership is free and independent of any subscription — a user can
+// register, receive the free group, and subscribe to a paid plan later (or never).
 model User {
-  id            String         @id @default(uuid())
-  phoneNumber   String         @unique @map("phone_number")
-  name          String?
-  email         String?
-  createdAt     DateTime       @default(now()) @map("created_at")
-  updatedAt     DateTime       @updatedAt @map("updated_at")
-  
+  id          String   @id @default(uuid())
+  // Human-facing membership number, e.g. "ZCN-7K4M2P". Separate from `id`, which
+  // is a database key and too long to read aloud or print. Nullable only so the
+  // column could be added to existing rows; always set on create.
+  memberId    String?  @unique @map("member_id")
+  phoneNumber String   @unique @map("phone_number")
+  name        String?
+  // Unique so it can be a login identifier. Nullable because bot-origin users
+  // predate registration and Postgres exempts NULLs from the constraint.
+  email       String?  @unique
+  // Set at registration. Null for users created by the WhatsApp bot, who
+  // therefore cannot log in until they register.
+  passwordHash String? @map("password_hash")
+
+  dateOfBirth  DateTime? @map("date_of_birth") @db.Date
+  occupation   String?
+  businessName String?   @map("business_name")
+  sector       String?
+  state        String?
+  country      String?
+  // Onboarding answers. Free text, nullable — members who registered before
+  // these questions existed have none, and they are never required to subscribe.
+  source       String?
+  whyJoin      String?   @map("why_join")
+  goal90       String?   @map("goal_90")
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
   subscriptions Subscription[]
   payments      Payment[]
-  
+
   @@index([phoneNumber])
+  @@index([email])
   @@map("users")
 }
 
 model Subscription {
-  id            String             @id @default(uuid())
-  userId        String             @map("user_id")
-  planId        String             @map("plan_id")
-  status        SubscriptionStatus @default(ACTIVE)
-  channel       PaymentChannel     @default(WHATSAPP)
-  startDate     DateTime           @map("start_date")
-  expiryDate    DateTime           @map("expiry_date")
-  graceEndDate  DateTime?          @map("grace_end_date")
-  paystackSubscriptionCode    String?            @unique @map("paystack_subscription_code")
-  paystackEmailToken          String?            @map("paystack_email_token")
-  paystackAuthorizationCode   String?            @map("paystack_authorization_code")
-  createdAt                   DateTime           @default(now()) @map("created_at")
-  updatedAt                   DateTime           @updatedAt @map("updated_at")
+  id                        String             @id @default(uuid())
+  userId                    String             @map("user_id")
+  // Plan.code. Kept as a plain string (not a FK) so existing rows and logs stay
+  // readable and no backfill is required; resolved through the plan service.
+  planId                    String             @map("plan_id")
+  // Which billing option was purchased. Nullable: rows predating tiered pricing
+  // have none, and their duration comes from the plan's monthly price.
+  planPriceId               String?            @map("plan_price_id")
+  status                    SubscriptionStatus @default(ACTIVE)
+  channel                   PaymentChannel     @default(WHATSAPP)
+  // Set by the subscription.not_renew webhook: Paystack will not auto-charge
+  // again, but the current paid period still runs to expiry.
+  cancelAtPeriodEnd         Boolean            @default(false) @map("cancel_at_period_end")
+  // When an admin confirmed the member was removed from the WhatsApp groups this
+  // subscription granted. WhatsApp's API can't do it, so removal is manual and
+  // this is what keeps it off the pending-removals list.
+  accessRevokedAt           DateTime?          @map("access_revoked_at")
+  startDate                 DateTime           @map("start_date")
+  expiryDate                DateTime           @map("expiry_date")
+  graceEndDate              DateTime?          @map("grace_end_date")
+  paystackSubscriptionCode  String?            @unique @map("paystack_subscription_code")
+  paystackEmailToken        String?            @map("paystack_email_token")
+  // Rotates when the customer updates their card, so it is only a best-effort
+  // match key for recurring charges.
+  paystackAuthorizationCode String?            @map("paystack_authorization_code")
+  // Stable across card changes — the durable fallback when the authorization
+  // code has rotated. See tryRecurringRenewalFromCharge.
+  paystackCustomerCode      String?            @map("paystack_customer_code")
+  createdAt                 DateTime           @default(now()) @map("created_at")
+  updatedAt                 DateTime           @updatedAt @map("updated_at")
 
-  user          User               @relation(fields: [userId], references: [id])
-  payments      Payment[]
+  user      User       @relation(fields: [userId], references: [id])
+  planPrice PlanPrice? @relation(fields: [planPriceId], references: [id])
+  payments  Payment[]
 
   @@index([userId])
   @@index([status])
   @@index([expiryDate])
   @@index([graceEndDate])
+  // Capacity checks filter by plan + status on every plan listing.
+  @@index([planId, status])
   @@map("subscriptions")
 }
 
+// A product tier a customer chooses (wealth, health, premium, apex).
+//
+// Deliberately separate from PlanPrice: Paystack's "plan" is a price point
+// (one amount + one interval), so a tier offering monthly/6-month/annual billing
+// maps to three Paystack plan codes. This is the tier; PlanPrice holds the codes.
+//
+// Retire a plan with isActive=false rather than deleting it — existing
+// subscribers must still resolve their plan at renewal.
+model Plan {
+  id             String   @id @default(uuid())
+  code           String   @unique
+  name           String
+  description    String?
+  // WhatsApp bot trigger phrases, e.g. ["JOIN WEALTH", "WEALTH"].
+  keywords       String[] @default([])
+  // null = unlimited. Apex is capped (VIP event has finite seats), which makes
+  // activation an inventory problem — see the capacity check at checkout.
+  maxSubscribers Int?     @map("max_subscribers")
+  isActive       Boolean  @default(true) @map("is_active")
+  sortOrder      Int      @default(0) @map("sort_order")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  prices   PlanPrice[]
+  benefits PlanBenefit[]
+
+  @@map("plans")
+}
+
+// One purchasable billing option for a Plan; maps 1:1 to a Paystack plan code.
+model PlanPrice {
+  id               String          @id @default(uuid())
+  planId           String          @map("plan_id")
+  interval         BillingInterval
+  amount           Int // kobo
+  // Access granted locally per successful charge. Must match the interval on the
+  // linked Paystack plan — verifyPlanConfiguration() checks for drift.
+  // Float so sub-day intervals are representable (an hourly plan grants 1/24).
+  durationDays     Float           @map("duration_days")
+  paystackPlanCode String          @unique @map("paystack_plan_code")
+  isActive         Boolean         @default(true) @map("is_active")
+  createdAt        DateTime        @default(now()) @map("created_at")
+  updatedAt        DateTime        @updatedAt @map("updated_at")
+
+  plan          Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+  payments      Payment[]
+
+  @@unique([planId, interval])
+  @@index([planId])
+  @@map("plan_prices")
+}
+
+// Something a plan grants. Typed so non-group perks (the Apex VIP event, and
+// whatever comes next) don't need a schema change.
+model Benefit {
+  id         String      @id @default(uuid())
+  code       String      @unique
+  type       BenefitType
+  name       String
+  // Populated for WHATSAPP_GROUP.
+  inviteLink String?     @map("invite_link")
+  metadata   Json?
+  isActive   Boolean     @default(true) @map("is_active")
+  createdAt  DateTime    @default(now()) @map("created_at")
+  updatedAt  DateTime    @updatedAt @map("updated_at")
+
+  plans PlanBenefit[]
+
+  @@map("benefits")
+}
+
+// Join: which benefits a plan grants. A benefit can belong to several plans —
+// Apex and the standalone plans share the wealth/health groups.
+model PlanBenefit {
+  planId    String @map("plan_id")
+  benefitId String @map("benefit_id")
+
+  plan    Plan    @relation(fields: [planId], references: [id], onDelete: Cascade)
+  benefit Benefit @relation(fields: [benefitId], references: [id], onDelete: Cascade)
+
+  @@id([planId, benefitId])
+  @@index([benefitId])
+  @@map("plan_benefits")
+}
+
+// Operator accounts. Currently used as alert recipients; `passwordHash` is
+// reserved for the dashboard login that will replace the shared ADMIN_API_KEY
+// (a browser can't safely hold a static key). Deactivate rather than delete so
+// past audit references stay resolvable.
+model Admin {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  name         String?
+  passwordHash String?   @map("password_hash")
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([email])
+  @@map("admins")
+}
+
 model Payment {
-  id              String        @id @default(uuid())
-  userId          String        @map("user_id")
-  subscriptionId  String?       @map("subscription_id")
-  reference       String        @unique @map("reference")
-  amount          Int           @map("amount")
-  currency        String        @default("NGN") @map("currency")
-  status          PaymentStatus @default(PENDING) @map("status")
-  channel         PaymentChannel @default(WHATSAPP)
-  planId          String        @map("plan_id")
-  paystackData    Json?         @map("paystack_data")
-  paidAt          DateTime?     @map("paid_at")
-  createdAt       DateTime      @default(now()) @map("created_at")
-  updatedAt       DateTime      @updatedAt @map("updated_at")
-  
-  user            User          @relation(fields: [userId], references: [id])
-  subscription    Subscription? @relation(fields: [subscriptionId], references: [id])
-  
+  id             String         @id @default(uuid())
+  userId         String         @map("user_id")
+  subscriptionId String?        @map("subscription_id")
+  reference      String         @unique @map("reference")
+  amount         Int            @map("amount")
+  currency       String         @default("NGN") @map("currency")
+  status         PaymentStatus  @default(PENDING) @map("status")
+  channel        PaymentChannel @default(WHATSAPP)
+  planId         String         @map("plan_id")
+  // Which billing option was bought; carried through to the Subscription at
+  // activation so expiry uses the right duration. Nullable for legacy rows.
+  planPriceId    String?        @map("plan_price_id")
+  // Paystack checkout URL, kept so an abandoned checkout can be resumed rather
+  // than creating another pending payment (which would also consume a seat on a
+  // capped plan).
+  authorizationUrl String?      @map("authorization_url")
+  paystackData   Json?          @map("paystack_data")
+  paidAt         DateTime?      @map("paid_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  user         User          @relation(fields: [userId], references: [id])
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+  planPrice    PlanPrice?    @relation(fields: [planPriceId], references: [id])
+
   @@index([userId])
   @@index([reference])
   @@index([status])
   @@index([subscriptionId])
+  // In-flight capacity tally: plan + status + recency.
+  @@index([planId, status, createdAt])
   @@map("payments")
 }
 
 model WebhookLog {
-  id          String   @id @default(uuid())
-  source      String   @map("source")
-  eventType   String   @map("event_type")
-  payload     Json     @map("payload")
-  processed   Boolean  @default(false) @map("processed")
-  error       String?   @map("error")
-  createdAt   DateTime @default(now()) @map("created_at")
-  
+  // Stable fingerprint of an inbound event, used to reject replays. Paystack
+  // sends no event ID, so it is derived from the payload — see eventKey().
+  eventKey     String?  @unique @map("event_key")
+  id        String   @id @default(uuid())
+  source    String   @map("source")
+  eventType String   @map("event_type")
+  payload   Json     @map("payload")
+  processed Boolean  @default(false) @map("processed")
+  error     String?  @map("error")
+  createdAt DateTime @default(now()) @map("created_at")
+
   @@index([source, createdAt])
   @@index([processed])
   @@map("webhook_logs")
@@ -90,7 +252,7 @@ model WebhookLog {
 
 model MessageLog {
   id          String   @id @default(uuid())
-  phoneNumber String  @map("phone_number")
+  phoneNumber String   @map("phone_number")
   direction   String   @map("direction")
   messageType String   @map("message_type")
   content     String   @map("content")
@@ -124,6 +286,25 @@ enum PaymentStatus {
   PENDING
   SUCCESS
   FAILED
+  REFUNDED
+}
+
+// Billing cadence. Maps to Paystack plan intervals:
+//   HOURLY -> hourly, DAILY -> daily, MONTHLY -> monthly,
+//   SEMIANNUAL -> biannually, ANNUAL -> annually
+enum BillingInterval {
+  // Paystack supports hourly/daily plans; useful for exercising the renewal and
+  // expiry cycle in minutes instead of waiting a month.
+  HOURLY
+  DAILY
+  MONTHLY
+  SEMIANNUAL
+  ANNUAL
+}
+
+enum BenefitType {
+  WHATSAPP_GROUP
+  EVENT_ACCESS
 }
 
 // How a subscription/payment was originated. Drives post-payment delivery:

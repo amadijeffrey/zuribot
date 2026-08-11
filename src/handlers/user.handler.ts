@@ -1,44 +1,112 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import { BillingInterval } from '@prisma/client';
 import { prisma } from '../config/database';
-import { SUBSCRIPTION_PLANS } from '../config/constants';
-import { initializePayment, verifyPayment } from '../services/payment';
+import {
+  initializePayment,
+  initializePlanChange,
+  initializeRenewalPayment,
+  verifyPayment,
+  PlanFullError,
+  SamePlanError,
+} from '../services/payment';
+import {
+  getPurchasablePlans,
+  resolvePlan,
+  checkCapacity,
+  checkCoverage,
+  priceForSubscription,
+} from '../services/plan';
 import { getSubscriptionForPlan } from '../services/subscription';
+import { sendWelcomeEmail } from '../services/email';
+import {
+  hashPassword,
+  verifyCredentials,
+  issueToken,
+  changePassword,
+  MIN_PASSWORD_LENGTH,
+} from '../services/user-auth';
+import { env } from '../config/env';
+import { withMemberId } from '../utils/member-id';
 import { logger } from '../utils/logger';
 
-const PLAN_IDS = Object.keys(SUBSCRIPTION_PLANS);
-
-// GET /plans — public plan catalogue for the frontend's plan picker. Fields are
-// picked explicitly so gated data (inviteLink, keywords) never leaks. `id` is
-// the value the frontend passes back as `planId` when calling /users/register.
+// GET /users/plans — public plan catalogue for the frontend's plan picker.
+// Invite links are never exposed here; they are delivered by email on activation.
 export const listPlans = async (_req: Request, res: Response): Promise<void> => {
-  const plans = Object.values(SUBSCRIPTION_PLANS).map((plan) => ({
-    id: plan.id,
-    name: plan.name,
-    amount: plan.amount,
-    description: plan.description,
-  }));
+  const plans = await getPurchasablePlans();
 
-  res.json({ plans });
+  const payload = await Promise.all(
+    plans.map(async (plan) => {
+      const capacity = await checkCapacity(plan.code);
+      return {
+        code: plan.code,
+        name: plan.name,
+        description: plan.description,
+        benefits: plan.benefits.map((b) => ({ name: b.name, type: b.type })),
+        soldOut: !capacity.hasCapacity,
+        seatsRemaining: capacity.remaining,
+        // `interval` is what the client sends back when subscribing — the
+        // PlanPrice UUID stays internal.
+        prices: plan.prices
+          .filter((pr) => pr.isActive)
+          .map((pr) => ({
+            interval: pr.interval,
+            amount: pr.amount,
+            durationDays: pr.durationDays,
+          })),
+      };
+    }),
+  );
+
+  res.json({ plans: payload });
 };
+
+const publicUser = (u: {
+  id: string;
+  memberId: string | null;
+  name: string | null;
+  email: string | null;
+  phoneNumber: string;
+}) => ({
+  id: u.id,
+  memberId: u.memberId,
+  name: u.name,
+  email: u.email,
+  phoneNumber: u.phoneNumber,
+});
+
+const intervalSchema = z
+  .string()
+  .transform((v) => v.trim().toUpperCase())
+  .pipe(z.nativeEnum(BillingInterval));
 
 const registerSchema = z.object({
   name: z.string().trim().min(1, 'Name is required').max(100),
   email: z.string().trim().toLowerCase().email('A valid email is required'),
+  password: z
+    .string()
+    .min(MIN_PASSWORD_LENGTH, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`),
   // E.164-ish: optional leading +, 7–15 digits, no leading zero.
   phoneNumber: z
     .string()
     .trim()
     .regex(/^\+?[1-9]\d{6,14}$/, 'A valid phone number is required'),
-  planId: z
-    .string()
-    .refine((id) => PLAN_IDS.includes(id), { message: `planId must be one of: ${PLAN_IDS.join(', ')}` }),
+  dateOfBirth: z.coerce.date().max(new Date(), { message: 'Date of birth must be in the past' }).optional(),
+  occupation: z.string().trim().max(100).optional(),
+  businessName: z.string().trim().max(150).optional(),
+  sector: z.string().trim().max(100).optional(),
+  state: z.string().trim().max(100).optional(),
+  country: z.string().trim().max(100).optional(),
+  // Onboarding questions. Generous caps because these are free-text answers,
+  // but bounded so a request body can't be used to bloat the row.
+  source: z.string().trim().max(200).optional(),
+  whyJoin: z.string().trim().max(2000).optional(),
+  goal90: z.string().trim().max(2000).optional(),
 });
 
-// POST /users/register — web registration. Creates/updates the user, then
-// returns a Paystack payment link. No password (auth is out of scope) and no
-// WhatsApp messaging: post-payment delivery goes through email + the frontend
-// redirect (see registrationStatus).
+// POST /users/register — creates a member account. Membership is free and carries
+// no plan: registering and subscribing are separate steps, so a member can join,
+// receive the free community group, and subscribe later or never.
 export const register = async (req: Request, res: Response): Promise<void> => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -49,30 +117,225 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const { name, email, phoneNumber, planId } = parsed.data;
+  const { password, ...profile } = parsed.data;
 
   try {
-    // phoneNumber is the unique identity; a user may already exist (e.g. from
-    // the bot). Upsert so we attach/refresh their name + email either way.
-    const user = await prisma.user.upsert({
-      where: { phoneNumber },
-      update: { name, email },
-      create: { phoneNumber, name, email },
+    const hash = await hashPassword(password);
+    // Create-only. The previous upsert-by-phone silently rewrote an existing
+    // member's name and email, which let anyone take over an account by
+    // registering with someone else's phone number.
+    const clash = await prisma.user.findFirst({
+      where: { OR: [{ phoneNumber: profile.phoneNumber }, { email: profile.email }] },
+      select: { id: true, phoneNumber: true, passwordHash: true, memberId: true },
     });
 
-    // Don't let someone double-pay for a plan they already hold.
-    const existing = await getSubscriptionForPlan(user.id, planId);
-    if (existing) {
+    if (clash) {
+      // A bot-created user has no password. Let them claim that record by
+      // registering with the same phone number, rather than being locked out of
+      // their own subscription history.
+      if (!clash.passwordHash && clash.phoneNumber === profile.phoneNumber) {
+        const claimed = await withMemberId((memberId) =>
+          prisma.user.update({
+            where: { id: clash.id },
+            data: {
+              ...profile,
+              passwordHash: hash,
+              // Bot-created rows predate member IDs.
+              ...(clash.memberId ? {} : { memberId }),
+            },
+          }),
+        );
+        await sendWelcomeEmail(claimed.id);
+        logger.info('Existing bot user claimed their account', { userId: claimed.id });
+        res.status(201).json({ token: issueToken(claimed), user: publicUser(claimed) });
+        return;
+      }
+
       res.status(409).json({
-        error: 'You already have an active subscription for this plan',
+        error: 'An account with this email or phone number already exists. Please log in.',
       });
       return;
     }
 
+    const user = await withMemberId((memberId) =>
+      prisma.user.create({ data: { ...profile, memberId, passwordHash: hash } }),
+    );
+
+    // Membership itself grants the free community group.
+    await sendWelcomeEmail(user.id);
+
+    logger.info('Member registered', { userId: user.id });
+    res.status(201).json({ token: issueToken(user), user: publicUser(user) });
+  } catch (error: any) {
+    logger.error('Registration failed', { error: error.message, email: profile.email });
+    res.status(500).json({ error: 'Registration failed. Please try again.' });
+  }
+};
+
+const loginSchema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  password: z.string().min(1),
+});
+
+// POST /users/login
+export const login = async (req: Request, res: Response): Promise<void> => {
+  if (!env.JWT_SECRET) {
+    logger.error('Member login attempted but JWT_SECRET is not configured');
+    res.status(503).json({ error: 'Login is not configured' });
+    return;
+  }
+
+  const parsed = loginSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Email and password are required' });
+    return;
+  }
+
+  const user = await verifyCredentials(parsed.data.email, parsed.data.password);
+  if (!user) {
+    // Same response for unknown account and wrong password.
+    res.status(401).json({ error: 'Invalid credentials' });
+    return;
+  }
+
+  res.json({ token: issueToken(user), expiresIn: env.JWT_EXPIRES_IN, user });
+};
+
+// GET /users/me — profile plus current subscriptions. Auth required.
+export const me = async (req: Request, res: Response): Promise<void> => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.member!.id },
+    include: { subscriptions: { orderBy: { createdAt: 'desc' } } },
+  });
+
+  if (!user) {
+    res.status(404).json({ error: 'Account not found' });
+    return;
+  }
+
+  const subscriptions = await Promise.all(
+    user.subscriptions.map(async (s) => {
+      const plan = await resolvePlan(s.planId);
+      const price = await priceForSubscription(s.planId, s.planPriceId);
+      return {
+        // Needed to call POST /users/subscriptions/:id/change.
+        id: s.id,
+        planId: s.planId,
+        planName: plan?.name,
+        interval: price?.interval,
+        status: s.status,
+        expiryDate: s.expiryDate,
+        cancelAtPeriodEnd: s.cancelAtPeriodEnd,
+      };
+    }),
+  );
+
+  res.json({
+    user: {
+      ...publicUser(user),
+      dateOfBirth: user.dateOfBirth,
+      occupation: user.occupation,
+      businessName: user.businessName,
+      sector: user.sector,
+      state: user.state,
+      country: user.country,
+      source: user.source,
+      whyJoin: user.whyJoin,
+      goal90: user.goal90,
+    },
+    subscriptions,
+  });
+};
+
+const subscribeSchema = z.object({
+  planId: z.string().min(1, 'planId is required'),
+  // Billing interval, e.g. "ANNUAL". Accepted in any case; normalised to the
+  // enum's uppercase form, which is what the rest of the API uses.
+  interval: intervalSchema.optional(),
+});
+
+// POST /users/subscribe — starts a payment for the authenticated member.
+// Separate from registration: a member subscribes from their dashboard, may hold
+// several plans, and re-subscribes without creating another account.
+export const subscribe = async (req: Request, res: Response): Promise<void> => {
+  const parsed = subscribeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: 'Validation failed',
+      details: parsed.error.flatten().fieldErrors,
+    });
+    return;
+  }
+
+  const { planId, interval } = parsed.data;
+  const member = req.member!;
+
+  const plan = await resolvePlan(planId);
+  if (!plan || !plan.isActive) {
+    res.status(400).json({ error: `Unknown or unavailable plan: ${planId}` });
+    return;
+  }
+
+  const purchasable = plan.prices.filter((pr) => pr.isActive);
+
+  // A tiered plan must say which interval — defaulting would silently charge the
+  // cheapest option to someone who meant to buy the annual one.
+  if (!interval && purchasable.length > 1) {
+    res.status(400).json({
+      error: 'This plan has multiple billing options — an interval is required',
+      availableIntervals: purchasable.map((pr) => pr.interval),
+    });
+    return;
+  }
+
+  if (interval && !purchasable.some((pr) => pr.interval === interval)) {
+    res.status(400).json({
+      error: `${interval} is not available for this plan`,
+      availableIntervals: purchasable.map((pr) => pr.interval),
+    });
+    return;
+  }
+
+  try {
+    const existing = await getSubscriptionForPlan(member.id, planId);
+    if (existing) {
+      // GRACE is not "already subscribed" — their access has lapsed and they are
+      // trying to recover it. Point them at renewal rather than refusing outright.
+      res.status(409).json({
+        error:
+          existing.status === 'GRACE'
+            ? 'This subscription is in its grace period — renew it instead'
+            : 'You already have an active subscription for this plan',
+        subscriptionId: existing.id,
+        status: existing.status,
+        renewUrl: `/api/users/subscriptions/${existing.id}/renew`,
+      });
+      return;
+    }
+
+    // Refuse to charge for a plan that adds nothing. Someone holding Apex buying
+    // Premium would pay again for groups they already have — a charge that ends
+    // up as a support ticket or a chargeback rather than revenue.
+    const coverage = await checkCoverage(member.id, planId);
+    if (coverage.fullyCovered) {
+      const names = await Promise.all(coverage.coveredBy.map(async (c) => (await resolvePlan(c))?.name ?? c));
+      res.status(409).json({
+        error: `Your ${names.join(' and ')} already includes everything in ${plan.name}`,
+        coveredBy: coverage.coveredBy,
+      });
+      return;
+    }
+
+    if (!member.email) {
+      res.status(400).json({ error: 'Your account has no email address' });
+      return;
+    }
+
     const payment = await initializePayment({
-      userId: user.id,
+      userId: member.id,
       planId,
-      email,
+      interval,
+      email: member.email,
       channel: 'WEB',
     });
 
@@ -81,15 +344,154 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       authorizationUrl: payment.authorizationUrl,
     });
   } catch (error: any) {
-    logger.error('Registration failed', { error: error.message, phoneNumber, planId });
-    res.status(500).json({ error: 'Registration failed. Please try again.' });
+    // A capped plan filling up is an expected outcome, not a server fault.
+    if (error instanceof PlanFullError) {
+      res.status(409).json({ error: 'This plan is fully subscribed', planId });
+      return;
+    }
+    logger.error('Subscribe failed', { error: error.message, userId: member.id, planId });
+    res.status(500).json({ error: 'Could not start payment. Please try again.' });
   }
 };
 
-// GET /users/registration-status?reference=... — called by the frontend success
-// page. Verifies the payment on demand (so it works even if the Paystack webhook
-// is delayed) and returns the invite link once the subscription is active.
-export const registrationStatus = async (req: Request, res: Response): Promise<void> => {
+// POST /users/subscriptions/:id/renew — pay for another period of the SAME plan.
+//
+// Distinct from /subscribe (which creates a new subscription) and from /change
+// (which switches plan or interval). This renews in place: the existing row is
+// reactivated and extended, so a member in their grace period recovers the
+// subscription they already have rather than starting a second one.
+export const renewSubscription = async (req: Request, res: Response): Promise<void> => {
+  const member = req.member!;
+
+  const subscription = await prisma.subscription.findUnique({ where: { id: req.params.id } });
+  if (!subscription || subscription.userId !== member.id) {
+    res.status(404).json({ error: 'Subscription not found' });
+    return;
+  }
+
+  // ACTIVE is allowed too — renewing early just extends from the current expiry,
+  // so no paid time is lost.
+  if (subscription.status !== 'ACTIVE' && subscription.status !== 'GRACE') {
+    res.status(400).json({
+      error: `This subscription has ${subscription.status.toLowerCase()} — subscribe again instead`,
+    });
+    return;
+  }
+
+  try {
+    const payment = await initializeRenewalPayment(subscription.id);
+    res.status(201).json({
+      reference: payment.reference,
+      authorizationUrl: payment.authorizationUrl,
+    });
+  } catch (error: any) {
+    logger.error('Renewal failed', { error: error.message, subscriptionId: subscription.id });
+    res.status(500).json({ error: 'Could not start the renewal. Please try again.' });
+  }
+};
+
+const changePlanSchema = z.object({
+  planId: z.string().min(1, 'planId is required'),
+  interval: intervalSchema.optional(),
+});
+
+// POST /users/subscriptions/:id/change — upgrade or downgrade.
+//
+// The new plan takes effect once payment succeeds, and unused days on the old
+// plan carry over rather than being refunded. Same path in both directions.
+export const changePlan = async (req: Request, res: Response): Promise<void> => {
+  const parsed = changePlanSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const { planId, interval } = parsed.data;
+  const member = req.member!;
+
+  // Ownership: a member may only change their own subscription.
+  const subscription = await prisma.subscription.findUnique({ where: { id: req.params.id } });
+  if (!subscription || subscription.userId !== member.id) {
+    res.status(404).json({ error: 'Subscription not found' });
+    return;
+  }
+
+  if (subscription.status !== 'ACTIVE' && subscription.status !== 'GRACE') {
+    res.status(400).json({
+      error: `Cannot change a ${subscription.status.toLowerCase()} subscription — subscribe instead`,
+    });
+    return;
+  }
+
+  const plan = await resolvePlan(planId);
+  if (!plan?.isActive) {
+    res.status(400).json({ error: `Unknown or unavailable plan: ${planId}` });
+    return;
+  }
+
+  const purchasable = plan.prices.filter((pr) => pr.isActive);
+  if (!interval && purchasable.length > 1) {
+    res.status(400).json({
+      error: 'This plan has multiple billing options — an interval is required',
+      availableIntervals: purchasable.map((pr) => pr.interval),
+    });
+    return;
+  }
+
+  try {
+    const payment = await initializePlanChange(subscription.id, planId, interval);
+    res.status(201).json({
+      reference: payment.reference,
+      authorizationUrl: payment.authorizationUrl,
+    });
+  } catch (error: any) {
+    if (error instanceof SamePlanError) {
+      res.status(409).json({ error: 'You are already on this plan and billing interval' });
+      return;
+    }
+    if (error instanceof PlanFullError) {
+      res.status(409).json({ error: 'This plan is fully subscribed', planId });
+      return;
+    }
+    logger.error('Plan change failed', { error: error.message, subscriptionId: subscription.id });
+    res.status(500).json({ error: 'Could not start the plan change. Please try again.' });
+  }
+};
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z
+    .string()
+    .min(MIN_PASSWORD_LENGTH, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`),
+});
+
+// POST /users/change-password
+export const updatePassword = async (req: Request, res: Response): Promise<void> => {
+  const parsed = changePasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const ok = await changePassword(
+    req.member!.id,
+    parsed.data.currentPassword,
+    parsed.data.newPassword,
+  );
+
+  if (!ok) {
+    res.status(401).json({ error: 'Current password is incorrect' });
+    return;
+  }
+
+  res.json({ success: true, message: 'Password updated' });
+};
+
+// GET /users/payment-status?reference=… — called by the frontend after Paystack
+// redirects back. Verifies on demand so it resolves even when the webhook is
+// delayed. Returns the outcome only: group links are delivered by email, which
+// handles multi-group plans and gives the customer a durable record.
+export const paymentStatus = async (req: Request, res: Response): Promise<void> => {
   const reference = String(req.query.reference || '').trim();
   if (!reference) {
     res.status(400).json({ error: 'reference query parameter is required' });
@@ -103,47 +505,43 @@ export const registrationStatus = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Verify-on-demand: if the webhook hasn't landed yet, confirm with Paystack
-    // ourselves. verifyPayment activates the subscription (idempotently) on success.
     if (payment.status === 'PENDING') {
       await verifyPayment(reference);
       payment = await prisma.payment.findUnique({ where: { reference } });
     }
 
     if (!payment || payment.status === 'PENDING') {
-      res.json({ status: 'pending' });
+      res.json({ status: 'pending', reference });
       return;
     }
 
     if (payment.status === 'FAILED') {
-      res.json({ status: 'failed' });
+      res.json({ status: 'failed', reference });
       return;
     }
 
-    // SUCCESS — resolve the subscription this payment activated.
     const subscription = payment.subscriptionId
       ? await prisma.subscription.findUnique({ where: { id: payment.subscriptionId } })
       : await prisma.subscription.findFirst({
-          where: { userId: payment.userId, planId: payment.planId, status: { in: ['ACTIVE', 'GRACE'] } },
+          where: {
+            userId: payment.userId,
+            planId: payment.planId,
+            status: { in: ['ACTIVE', 'GRACE'] },
+          },
           orderBy: { createdAt: 'desc' },
         });
 
     if (!subscription || (subscription.status !== 'ACTIVE' && subscription.status !== 'GRACE')) {
-      // Paid but not activated (e.g. underpayment flagged for review) — don't
-      // expose an invite link; tell the frontend it's still processing.
-      res.json({ status: 'processing' });
+      // Paid but not activated (underpayment, oversold plan, or an activation
+      // error). Admins are alerted; surface the reference for support.
+      res.json({ status: 'processing', reference });
       return;
     }
 
-    const plan = SUBSCRIPTION_PLANS[payment.planId as keyof typeof SUBSCRIPTION_PLANS];
-    res.json({
-      status: 'active',
-      planName: plan?.name,
-      inviteLink: plan?.inviteLink,
-      expiryDate: subscription.expiryDate,
-    });
+    const plan = await resolvePlan(payment.planId);
+    res.json({ status: 'active', planName: plan?.name, reference });
   } catch (error: any) {
-    logger.error('registration-status failed', { error: error.message, reference });
-    res.status(500).json({ error: 'Could not resolve registration status' });
+    logger.error('payment-status failed', { error: error.message, reference });
+    res.status(500).json({ error: 'Could not resolve payment status' });
   }
 };

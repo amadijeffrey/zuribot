@@ -5,6 +5,24 @@ import { prisma } from '../config/database';
 import { processWebhookEvent, verifyPayment } from '../services/payment';
 import { logger } from '../utils/logger';
 
+// Paystack sends no event ID, so a replay is only detectable by fingerprinting
+// the payload. Hashing the raw bytes would make every retry look distinct if
+// Paystack re-serialises, so the key is built from the fields that identify the
+// event itself.
+const eventKey = (body: any): string | null => {
+  const d = body?.data;
+  if (!body?.event || !d) return null;
+
+  const identity = [
+    body.event,
+    d.id ?? d.reference ?? d.invoice_code ?? d.subscription_code ?? '',
+    d.status ?? '',
+    d.paid_at ?? d.updatedAt ?? '',
+  ].join('|');
+
+  return crypto.createHash('sha256').update(identity).digest('hex');
+};
+
 export const handlePaystackWebhook = async (req: Request, res: Response): Promise<void> => {
   const signature = req.headers['x-paystack-signature'] as string;
   const signatureValid = verifySignature(req, signature);
@@ -13,17 +31,52 @@ export const handlePaystackWebhook = async (req: Request, res: Response): Promis
   // signature, so we always have an audit trail / replay source — even
   // for events we reject (a real Paystack outage + signature mismatch
   // would otherwise vanish silently, as happened during the prior bug).
-  const log = env.ENABLE_WEBHOOK_LOGGING
-    ? await prisma.webhookLog.create({
+  const key = eventKey(req.body);
+
+  // Replay guard. Handlers are individually idempotent, so a replay cannot
+  // double-charge — but every alert path would fire again, and an attacker
+  // replaying one captured payload could bury real alerts under duplicates.
+  if (signatureValid && key) {
+    const seen = await prisma.webhookLog.findUnique({ where: { eventKey: key } });
+    if (seen?.processed) {
+      logger.info('Duplicate Paystack webhook ignored', {
+        event: req.body?.event,
+        originalLogId: seen.id,
+      });
+      res.status(200).send('OK');
+      return;
+    }
+  }
+
+  let log = null;
+  let duplicate = false;
+
+  if (env.ENABLE_WEBHOOK_LOGGING) {
+    try {
+      log = await prisma.webhookLog.create({
         data: {
           source: 'paystack',
           eventType: req.body?.event ?? 'unknown',
+          eventKey: key,
           payload: req.body,
           processed: false,
           error: signatureValid ? null : 'signature_invalid',
         },
-      })
-    : null;
+      });
+    } catch (error: any) {
+      // Two deliveries of the same event can both pass the check above before
+      // either has been recorded. The unique index settles the race; the loser
+      // must NOT process, or both would run and both would alert.
+      if (error?.code === 'P2002') duplicate = true;
+      else throw error;
+    }
+  }
+
+  if (duplicate) {
+    logger.info('Concurrent duplicate Paystack webhook ignored', { event: req.body?.event });
+    res.status(200).send('OK');
+    return;
+  }
 
   if (!signatureValid) {
     logger.error('Invalid Paystack webhook signature', { webhookLogId: log?.id });

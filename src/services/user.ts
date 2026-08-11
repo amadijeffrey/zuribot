@@ -1,6 +1,29 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { CreateUserParams } from '../types';
 import { logger } from '../utils/logger';
+
+// Every place that returns a User to an HTTP client must select through this
+// rather than using a bare query or `include: { user: true }` — Prisma returns
+// every column by default, and that includes passwordHash.
+export const SAFE_USER_SELECT = {
+  id: true,
+  memberId: true,
+  phoneNumber: true,
+  name: true,
+  email: true,
+  dateOfBirth: true,
+  occupation: true,
+  businessName: true,
+  sector: true,
+  state: true,
+  country: true,
+  source: true,
+  whyJoin: true,
+  goal90: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.UserSelect;
 
 export const getOrCreateUser = async (params: CreateUserParams) => {
   const { phoneNumber, name, email } = params;

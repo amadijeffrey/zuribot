@@ -5,6 +5,7 @@ import webhookRoutes from './webhook.routes';
 import paystackRoutes from './paystack.routes';
 import adminRoutes from './admin.routes';
 import userRoutes from './users.routes';
+import cronRoutes from './cron.routes';
 
 const router = Router();
 
@@ -38,5 +39,6 @@ router.use('/', webhookRoutes);
 router.use('/', paystackRoutes);
 router.use('/api/admin', adminRoutes);
 router.use('/api/users', userRoutes);
+router.use('/internal/cron', cronRoutes);
 
 export default router;

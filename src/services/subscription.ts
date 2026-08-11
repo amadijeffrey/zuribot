@@ -1,6 +1,9 @@
 import { prisma } from '../config/database';
-import { SUBSCRIPTION_PLANS, GRACE_PERIOD_DAYS } from '../config/constants';
+import { env } from '../config/env';
+import { GRACE_PERIOD_DAYS } from '../config/constants';
+import { resolvePlan } from './plan';
 import { sendTextMessage, sendCtaUrlMessage } from './whatsapp';
+import { sendGracePeriodEmail, sendExpiryEmail, sendExtensionEmail } from './email';
 import { logger } from '../utils/logger';
 import { SubscriptionStats } from '../types';
 
@@ -74,7 +77,7 @@ export const expireSubscription = async (subscriptionId: string): Promise<void> 
   await sendExpiryNotification(subscription.user.phoneNumber, subscription.planId);
 };
 
-export const getExpiredSubscriptions = async () => {
+export const getExpiredSubscriptions = async (take?: number) => {
   const now = new Date();
   // For recurring subs, give the renewal webhook a 24h buffer to arrive before
   // we treat the sub as expired.
@@ -89,17 +92,105 @@ export const getExpiredSubscriptions = async () => {
       ],
     },
     include: { user: true },
+    orderBy: { expiryDate: 'asc' },
+    ...(take ? { take } : {}),
   });
 };
 
-export const getGracePeriodExpired = async () => {
+export const getGracePeriodExpired = async (take?: number) => {
   return prisma.subscription.findMany({
     where: {
       status: 'GRACE',
       graceEndDate: { lte: new Date() },
     },
     include: { user: true },
+    orderBy: { graceEndDate: 'asc' },
+    ...(take ? { take } : {}),
   });
+};
+
+export interface ExpirySweepResult {
+  movedToGrace: number;
+  expired: number;
+  skipped: number;
+  notifyFailures: number;
+}
+
+// Advances subscriptions whose time has run out: ACTIVE→GRACE at expiry, and
+// GRACE→EXPIRED once the grace window closes.
+//
+// Safe to run repeatedly and concurrently (cron + admin trigger at once): each
+// row is advanced with a conditional updateMany, so only the caller that
+// actually flips the status sends the notification. Batched so a backlog can't
+// exceed the serverless function limit — re-run until counts come back zero.
+export const runExpirySweep = async (batchSize = 100): Promise<ExpirySweepResult> => {
+  const result: ExpirySweepResult = { movedToGrace: 0, expired: 0, skipped: 0, notifyFailures: 0 };
+
+  // Notifications are best-effort: a failed WhatsApp/SMTP call must not abort the
+  // sweep or undo a status change the user's access already depends on.
+  const notify = async (fn: () => Promise<void>, ctx: object) => {
+    try {
+      await fn();
+    } catch (error: any) {
+      result.notifyFailures++;
+      logger.error('Sweep notification failed', { ...ctx, error: error.message });
+    }
+  };
+
+  for (const sub of await getExpiredSubscriptions(batchSize)) {
+    const claim = await prisma.subscription.updateMany({
+      where: { id: sub.id, status: 'ACTIVE' },
+      data: {
+        status: 'GRACE',
+        graceEndDate: new Date(Date.now() + GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000),
+      },
+    });
+
+    if (claim.count === 0) {
+      result.skipped++;
+      continue;
+    }
+
+    result.movedToGrace++;
+    logger.info('Sweep: subscription moved to grace period', {
+      subscriptionId: sub.id,
+      userId: sub.userId,
+    });
+
+    await notify(
+      () =>
+        sub.channel === 'WHATSAPP' && env.ENABLE_WHATSAPP_NOTIFICATIONS
+          ? sendGracePeriodNotification(sub.user.phoneNumber, sub.planId)
+          : sendGracePeriodEmail(sub.userId, sub.planId),
+      { subscriptionId: sub.id, stage: 'grace' },
+    );
+  }
+
+  for (const sub of await getGracePeriodExpired(batchSize)) {
+    const claim = await prisma.subscription.updateMany({
+      where: { id: sub.id, status: 'GRACE' },
+      data: { status: 'EXPIRED' },
+    });
+
+    if (claim.count === 0) {
+      result.skipped++;
+      continue;
+    }
+
+    result.expired++;
+    logger.info('Sweep: subscription expired', { subscriptionId: sub.id, userId: sub.userId });
+
+    await notify(
+      () =>
+        sub.channel === 'WHATSAPP' && env.ENABLE_WHATSAPP_NOTIFICATIONS
+          ? sendExpiryNotification(sub.user.phoneNumber, sub.planId)
+          : sendExpiryEmail(sub.userId, sub.planId),
+      { subscriptionId: sub.id, stage: 'expired' },
+    );
+  }
+
+  logger.info('Expiry sweep complete', { ...result });
+  return result;
 };
 
 export const sendActivationConfirmation = async (
@@ -112,8 +203,11 @@ export const sendActivationConfirmation = async (
     return;
   }
 
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
-  const subscription = await getActiveSubscription(userId);
+  const plan = await resolvePlan(planId);
+  // Must be THIS plan's subscription: a user can hold several, and
+  // getActiveSubscription returns whichever is newest regardless of plan —
+  // which would quote the wrong expiry date back to them.
+  const subscription = await getSubscriptionForPlan(userId, planId);
   const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
 
   const message = `🎉 *Payment Successful!*\n\n` +
@@ -123,12 +217,14 @@ export const sendActivationConfirmation = async (
 
   await sendTextMessage(user.phoneNumber, message);
 
-  if (plan?.inviteLink) {
+  // One CTA per group — WhatsApp allows a single URL per CTA message, so a
+  // multi-group plan sends several.
+  for (const group of plan?.groupLinks ?? []) {
     await sendCtaUrlMessage(
       user.phoneNumber,
-      `Tap the button below to join your exclusive *${plan?.name}* group.`,
+      `Tap below to join *${group.name}*.`,
       'Join the group',
-      plan.inviteLink,
+      group.inviteLink,
       'This link is exclusive to your subscription.'
     );
   }
@@ -148,8 +244,8 @@ export const sendRenewalConfirmation = async (
     return;
   }
 
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
-  const subscription = await getActiveSubscription(userId);
+  const plan = await resolvePlan(planId);
+  const subscription = await getSubscriptionForPlan(userId, planId);
   const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
 
   const message = `🔄 *Renewal Successful!*\n\n` +
@@ -165,7 +261,7 @@ const sendGracePeriodNotification = async (
   phoneNumber: string,
   planId: string
 ): Promise<void> => {
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+  const plan = await resolvePlan(planId);
 
   const message = `⚠️ *Subscription Expired*\n\n` +
     `Your *${plan?.name}* subscription has expired.\n\n` +
@@ -179,7 +275,7 @@ const sendExpiryNotification = async (
   phoneNumber: string,
   planId: string
 ): Promise<void> => {
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+  const plan = await resolvePlan(planId);
 
   const message = `❌ *Access Revoked*\n\n` +
     `Your *${plan?.name}* subscription and grace period have ended.\n\n` +
@@ -194,7 +290,7 @@ export const sendExpiryReminder = async (
   planId: string,
   daysRemaining: number
 ): Promise<void> => {
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+  const plan = await resolvePlan(planId);
   const emoji = daysRemaining === 1 ? '🚨' : daysRemaining <= 3 ? '⚠️' : '📢';
 
   const message = `${emoji} *Subscription Expiring Soon*\n\n` +
@@ -274,10 +370,7 @@ export const extendSubscription = async (
     data: { expiryDate: newExpiryDate, status: 'ACTIVE' },
   });
 
-  await sendTextMessage(
-    subscription.user.phoneNumber,
-    `Good news! Your subscription has been extended by ${days} days.\n\nNew expiry date: ${newExpiryDate.toLocaleDateString()}`
-  );
+  await sendExtensionEmail(subscription.userId, subscription.planId, days, newExpiryDate);
 
   logger.info('Subscription extended', { subscriptionId, days });
 

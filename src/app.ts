@@ -1,6 +1,7 @@
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
+import { env } from './config/env';
 import routes from './routes';
 import { errorHandler } from './middleware/error';
 import { apiRateLimiter } from './middleware/rate-limit';
@@ -11,10 +12,14 @@ const app = express();
 // Security headers
 app.use(helmet());
 
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
-  : []
-  
+const allowedOrigins = env.ALLOWED_ORIGINS
+  ? env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
+  : [];
+
+if (allowedOrigins.length === 0) {
+  logger.warn('ALLOWED_ORIGINS is empty — all browser origins will be rejected');
+}
+
 app.use(cors({
    origin: (origin, callback) => {
     if (!origin) {
@@ -24,8 +29,8 @@ app.use(cors({
     if (allowedOrigins.includes(origin)) {
       callback(null, true)
     } else {
-      console.error('Not allowed by CORS')
-      callback(new Error('Not allowed by CORS'))
+      logger.warn('Blocked by CORS', { origin });
+      callback(new Error('Not allowed by CORS'));
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE'],

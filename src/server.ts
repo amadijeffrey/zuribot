@@ -3,11 +3,32 @@ import { env } from './config/env';
 import { prisma } from './config/database';
 import { logger } from './utils/logger';
 
+// A brief network blip on the way up should not kill the process. Prisma
+// connects lazily anyway, so this is a readiness probe rather than a hard
+// requirement — retrying briefly avoids a single dropped packet taking the
+// server down and, on a scheduled host, triggering a restart loop.
+const connectWithRetry = async (attempts = 5): Promise<void> => {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await prisma.$connect();
+      logger.info('Database connected', { attempt });
+      return;
+    } catch (error: any) {
+      if (attempt === attempts) throw error;
+      const delayMs = Math.min(500 * 2 ** (attempt - 1), 5000);
+      logger.warn('Database not reachable, retrying', {
+        attempt,
+        nextRetryMs: delayMs,
+        code: error?.errorCode ?? error?.code,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+};
+
 const startServer = async () => {
   try {
-    // Test database connection
-    await prisma.$connect();
-    logger.info('Database connected');
+    await connectWithRetry();
 
     // Start server
     const server = app.listen(env.PORT, () => {

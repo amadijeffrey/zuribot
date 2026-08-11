@@ -1,3 +1,4 @@
+import type { BillingInterval } from '@prisma/client';
 export * from './whatsapp.types';
 
 export interface InitializePaymentParams {
@@ -7,6 +8,10 @@ export interface InitializePaymentParams {
   // Origination channel. Defaults to WHATSAPP; WEB adds a Paystack redirect
   // (callback_url) and routes post-payment delivery through email, not WhatsApp.
   channel?: 'WHATSAPP' | 'WEB';
+  // Which billing interval to charge for a tiered plan, e.g. 'SEMIANNUAL'.
+  // Omit only for single-interval plans; the caller resolves it to a PlanPrice.
+  // Typed from the Prisma enum so the two cannot drift apart.
+  interval?: BillingInterval;
 }
 
 export interface InitializePaymentResult {

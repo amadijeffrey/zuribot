@@ -6,9 +6,13 @@ import {
   getSubscriptions,
   extendSubscription as extendSub,
   moveToGracePeriod,
+  runExpirySweep,
 } from '../services/subscription';
-import { sendTextMessage, sendCtaUrlMessage } from '../services/whatsapp';
-import { SUBSCRIPTION_PLANS } from '../config/constants';
+import { verifyPlanConfiguration, runReconciliation } from '../services/payment';
+import { getPendingRemovals, markAccessRevoked } from '../services/removal';
+import { sendCustomEmail, resendGroupLinksEmail } from '../services/email';
+import { resolvePlan } from '../services/plan';
+import { SAFE_USER_SELECT } from '../services/user';
 import { logger } from '../utils/logger';
 
 export const getUsers = async (req: Request, res: Response): Promise<void> => {
@@ -21,7 +25,8 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
-      include: {
+      select: {
+        ...SAFE_USER_SELECT,
         subscriptions: { orderBy: { createdAt: 'desc' }, take: 1 },
       },
     }),
@@ -39,7 +44,8 @@ export const getUser = async (req: Request, res: Response): Promise<void> => {
 
   const user = await prisma.user.findUnique({
     where: { id },
-    include: {
+    select: {
+      ...SAFE_USER_SELECT,
       subscriptions: { orderBy: { createdAt: 'desc' } },
       payments: { orderBy: { createdAt: 'desc' } },
     },
@@ -107,22 +113,20 @@ export const resendGroupLink = async (req: Request, res: Response): Promise<void
     return;
   }
 
-  const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
-  if (!plan?.inviteLink) {
-    res.status(400).json({ error: 'No invite link configured for this plan' });
+  const plan = await resolvePlan(subscription.planId);
+  if (!plan?.groupLinks.length) {
+    res.status(400).json({ error: 'No invite links configured for this plan' });
     return;
   }
 
-  await sendCtaUrlMessage(
-    user.phoneNumber,
-    `Tap the button below to join your exclusive *${plan.name}* group.`,
-    'Join the group',
-    plan.inviteLink,
-    'This link is exclusive to your subscription.'
-  );
+  const delivered = await resendGroupLinksEmail(id, subscription.planId);
+  if (!delivered) {
+    res.status(400).json({ error: 'Could not email the links — user has no email address' });
+    return;
+  }
 
-  logger.info('Group link resent', { userId: id, adminAction: true });
-  res.json({ success: true, message: 'Group link sent' });
+  logger.info('Group links resent', { userId: id, count: plan.groupLinks.length, adminAction: true });
+  res.json({ success: true, message: `${plan.groupLinks.length} group link(s) emailed` });
 };
 
 export const sendMessageToUser = async (req: Request, res: Response): Promise<void> => {
@@ -140,10 +144,16 @@ export const sendMessageToUser = async (req: Request, res: Response): Promise<vo
     return;
   }
 
-  const messageId = await sendTextMessage(user.phoneNumber, message);
+  const { subject } = req.body;
+  const delivered = await sendCustomEmail(id, subject || 'A message from ZuriCircle', message);
+
+  if (!delivered) {
+    res.status(400).json({ error: 'Could not send — user has no email address' });
+    return;
+  }
 
   logger.info('Manual message sent', { userId: id, adminAction: true });
-  res.json({ success: true, messageId });
+  res.json({ success: true });
 };
 
 export const simulatePaymentFailed = async (req: Request, res: Response): Promise<void> => {
@@ -163,6 +173,76 @@ export const simulatePaymentFailed = async (req: Request, res: Response): Promis
   await moveToGracePeriod(id);
   logger.info('Grace period simulated', { subscriptionId: id, adminAction: true });
   res.json({ success: true, message: 'Subscription moved to GRACE period' });
+};
+
+// Manual trigger for the same sweep the scheduler runs. Useful while cron is
+// disabled, for re-running after a fix, and for verifying behaviour in production.
+// Idempotent, so it is safe to run alongside a scheduled sweep.
+export const runSweep = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const result = await runExpirySweep();
+    logger.info('Expiry sweep run', { ...result, adminAction: true });
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    logger.error('Admin expiry sweep failed', { error: error.message });
+    res.status(500).json({ error: 'Sweep failed' });
+  }
+};
+
+// Compares each plan's local amount/durationDays against what Paystack actually
+// bills. Run after any plan change on either side.
+export const verifyPlans = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const checks = await verifyPlanConfiguration();
+    const drifted = checks.filter(c => !c.ok);
+    res.status(drifted.length ? 409 : 200).json({
+      ok: drifted.length === 0,
+      drifted: drifted.length,
+      checks,
+    });
+  } catch (error: any) {
+    logger.error('Plan verification failed', { error: error.message });
+    res.status(500).json({ error: 'Plan verification failed' });
+  }
+};
+
+// Members whose access should be withdrawn from WhatsApp groups. Computed so an
+// admin never removes someone still entitled via another live plan.
+export const pendingRemovals = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const pending = await getPendingRemovals();
+    res.json({
+      count: pending.length,
+      pending: pending.filter(p => p.removeFrom.length > 0),
+      // Nothing to do for these — every group they held is still granted by
+      // another live subscription. Listed so they can be cleared off the queue.
+      noActionNeeded: pending.filter(p => p.removeFrom.length === 0),
+    });
+  } catch (error: any) {
+    logger.error('Pending removals failed', { error: error.message });
+    res.status(500).json({ error: 'Could not compute pending removals' });
+  }
+};
+
+// Records that the manual WhatsApp removal was done, clearing it off the list.
+export const confirmRemoval = async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const changed = await markAccessRevoked(id);
+  logger.info('Removal confirmed', { subscriptionId: id, changed, adminAction: true });
+  res.json({ success: true, alreadyRecorded: !changed });
+};
+
+// Pulls state from Paystack instead of waiting for webhooks. Safe to re-run.
+export const reconcile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const result = await runReconciliation({
+      includeSubscriptions: req.query.subscriptions === 'true',
+    });
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    logger.error('Reconciliation failed', { error: error.message });
+    res.status(500).json({ error: 'Reconciliation failed' });
+  }
 };
 
 export const extendSubscription = async (req: Request, res: Response): Promise<void> => {
@@ -197,14 +277,14 @@ export const broadcast = async (req: Request, res: Response): Promise<void> => {
     case 'active':
       const activeSubscriptions = await prisma.subscription.findMany({
         where: { status: 'ACTIVE' },
-        include: { user: true },
+        include: { user: { select: SAFE_USER_SELECT } },
       });
       users = activeSubscriptions.map(s => s.user);
       break;
     case 'expired':
       const expiredSubscriptions = await prisma.subscription.findMany({
         where: { status: 'EXPIRED' },
-        include: { user: true },
+        include: { user: { select: SAFE_USER_SELECT } },
       });
       users = expiredSubscriptions.map(s => s.user);
       break;
@@ -214,18 +294,25 @@ export const broadcast = async (req: Request, res: Response): Promise<void> => {
 
   const uniqueUsers = Array.from(new Map(users.map(u => [u.id, u])).values());
 
+  const { subject } = req.body;
   let sent = 0;
   let failed = 0;
 
-  for (const user of uniqueUsers) {
-    try {
-      await sendTextMessage(user.phoneNumber, message);
-      sent++;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    } catch (error) {
-      failed++;
-      logger.error('Broadcast message failed', { userId: user.id, error });
-    }
+  // Sent in parallel batches rather than one-at-a-time with a sleep: email is an
+  // HTTP call of a few hundred ms, so batching keeps a broadcast inside the
+  // serverless time limit instead of timing out partway and leaving no record of
+  // who was reached.
+  const BATCH = 20;
+  for (let i = 0; i < uniqueUsers.length; i += BATCH) {
+    const results = await Promise.all(
+      uniqueUsers
+        .slice(i, i + BATCH)
+        .map(u =>
+          sendCustomEmail(u.id, subject || 'An update from ZuriCircle', message).catch(() => false),
+        ),
+    );
+    sent += results.filter(Boolean).length;
+    failed += results.filter(r => !r).length;
   }
 
   logger.info('Broadcast completed', { sent, failed, filter });
@@ -247,7 +334,7 @@ export const getPayments = async (req: Request, res: Response): Promise<void> =>
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
-      include: { user: true },
+      include: { user: { select: SAFE_USER_SELECT } },
     }),
     prisma.payment.count({ where }),
   ]);

@@ -1,6 +1,7 @@
 import { prisma } from '../config/database';
 import { env } from '../config/env';
-import { SUBSCRIPTION_PLANS, UPGRADE_KEYWORDS } from '../config/constants';
+import { UPGRADE_KEYWORDS } from '../config/constants';
+import { getPurchasablePlans, resolvePlan, matchPlanByKeyword } from './plan';
 import { getOrCreateUser } from './user';
 import { initializePayment, initializeRenewalPayment } from './payment';
 import { sendTextMessage, sendInteractiveButtons, sendInteractiveList } from './whatsapp';
@@ -76,7 +77,7 @@ const handleTextMessage = async (user: any, text: string): Promise<void> => {
   }
 
   // Detect direct subscription intent (e.g., "JOIN WEALTH")
-  const matchedPlan = detectSubscriptionIntent(normalizedText);
+  const matchedPlan = await detectSubscriptionIntent(normalizedText);
 
   if (matchedPlan) {
     await handleSubscriptionRequest(user, matchedPlan);
@@ -111,25 +112,25 @@ const handleTextMessage = async (user: any, text: string): Promise<void> => {
   );
 };
 
-const detectSubscriptionIntent = (text: string): string | null => {
-  for (const plan of Object.values(SUBSCRIPTION_PLANS)) {
-    for (const keyword of plan.keywords) {
-      if (text.includes(keyword.toUpperCase())) {
-        return plan.id;
-      }
-    }
-  }
-  return null;
+const detectSubscriptionIntent = async (text: string): Promise<string | null> => {
+  const plan = await matchPlanByKeyword(text);
+  return plan?.code ?? null;
 };
 
 const sendAvailablePlans = async (phoneNumber: string): Promise<void> => {
+  const plans = await getPurchasablePlans();
   const sections = [{
     title: 'Available Plans',
-    rows: Object.values(SUBSCRIPTION_PLANS).map(plan => ({
-      id: `select_plan_${plan.id}`,
-      title: plan.name,
-      description: `₦${(plan.amount / 100).toLocaleString()} - ${plan.durationDays} days`,
-    })),
+    rows: plans.map(plan => {
+      const price = plan.defaultPrice;
+      return {
+        id: `select_plan_${plan.code}`,
+        title: plan.name,
+        description: price
+          ? `From ₦${(price.amount / 100).toLocaleString()} - ${price.durationDays} days`
+          : plan.description ?? '',
+      };
+    }),
   }];
 
   await sendInteractiveList(
@@ -146,7 +147,7 @@ const sendAvailablePlans = async (phoneNumber: string): Promise<void> => {
 
 const handleSubscriptionRequest = async (user: any, planId: string): Promise<void> => {
   const phoneNumber = user.phoneNumber;
-  const plan = SUBSCRIPTION_PLANS[planId as keyof typeof SUBSCRIPTION_PLANS];
+  const plan = await resolvePlan(planId);
 
   if (!plan) {
     await sendTextMessage(phoneNumber, 'Invalid plan selected. Reply with *UPGRADE* to see available plans.');
@@ -187,8 +188,8 @@ const handleSubscriptionRequest = async (user: any, planId: string): Promise<voi
   // Send plan details with payment link
   const message = `*${plan.name}*\n\n` +
     `${plan.description}\n\n` +
-    `💰 *Amount:* ₦${(plan.amount / 100).toLocaleString()}\n` +
-    `⏱️ *Duration:* ${plan.durationDays} days\n\n` +
+    `💰 *Amount:* ₦${((plan.defaultPrice?.amount ?? 0) / 100).toLocaleString()}\n` +
+    `⏱️ *Duration:* ${plan.defaultPrice?.durationDays ?? 0} days\n\n` +
     `Click the link below to complete your payment:\n\n` +
     `${payment.authorizationUrl}\n\n` +
     `_Reference: ${payment.reference}_`;
@@ -213,8 +214,8 @@ const handleStatusCheck = async (user: any): Promise<void> => {
     return;
   }
 
-  const lines = subscriptions.map(subscription => {
-    const plan = SUBSCRIPTION_PLANS[subscription.planId as keyof typeof SUBSCRIPTION_PLANS];
+  const lines = await Promise.all(subscriptions.map(async subscription => {
+    const plan = await resolvePlan(subscription.planId);
     const expiryDate = subscription.expiryDate.toLocaleDateString();
     const daysRemaining = Math.max(
       Math.ceil((subscription.expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)),
@@ -228,7 +229,7 @@ const handleStatusCheck = async (user: any): Promise<void> => {
       `📅 *Expires:* ${expiryDate}\n` +
       `⏳ *Days Remaining:* ${daysRemaining}` +
       `${subscription.status === 'GRACE' ? '\n⚠️ Renew now to maintain access!' : ''}`;
-  });
+  }));
 
   const message = `*Your Subscription Status*\n\n` + lines.join('\n\n─────────────\n\n');
 
@@ -254,16 +255,20 @@ const handleRenewalRequest = async (user: any): Promise<void> => {
     if (!latestByPlan.has(sub.planId)) latestByPlan.set(sub.planId, sub);
   }
 
-  const rows = Array.from(latestByPlan.values()).flatMap(sub => {
-    const plan = SUBSCRIPTION_PLANS[sub.planId as keyof typeof SUBSCRIPTION_PLANS];
-    if (!plan) return [];
-    const statusLabel = sub.status === 'GRACE' ? 'In grace' : 'Active';
-    return [{
-      id: `renew_plan_${sub.planId}`,
-      title: plan.name,
-      description: `${statusLabel} • Expires ${sub.expiryDate.toLocaleDateString()}`,
-    }];
-  });
+  const rows = (
+    await Promise.all(
+      Array.from(latestByPlan.values()).map(async sub => {
+        const plan = await resolvePlan(sub.planId);
+        if (!plan) return [];
+        const statusLabel = sub.status === 'GRACE' ? 'In grace' : 'Active';
+        return [{
+          id: `renew_plan_${sub.planId}`,
+          title: plan.name,
+          description: `${statusLabel} • Expires ${sub.expiryDate.toLocaleDateString()}`,
+        }];
+      }),
+    )
+  ).flat();
 
   if (rows.length === 0) {
     await sendAvailablePlans(user.phoneNumber);
@@ -293,7 +298,7 @@ const handleRenewalSelection = async (user: any, planId: string): Promise<void> 
     return;
   }
 
-  const plan = SUBSCRIPTION_PLANS[target.planId as keyof typeof SUBSCRIPTION_PLANS];
+  const plan = await resolvePlan(target.planId);
   if (!plan) {
     await sendTextMessage(user.phoneNumber, 'Plan not found.');
     return;
@@ -306,8 +311,8 @@ const handleRenewalSelection = async (user: any, planId: string): Promise<void> 
     const payment = await initializeRenewalPayment(target.id);
 
     const message = `🔄 *${plan.name} — Renewal*\n\n` +
-      `💰 *Amount:* ₦${(plan.amount / 100).toLocaleString()}\n` +
-      `⏱️ *Extends by:* ${plan.durationDays} days\n\n` +
+      `💰 *Amount:* ₦${((plan.defaultPrice?.amount ?? 0) / 100).toLocaleString()}\n` +
+      `⏱️ *Extends by:* ${plan.defaultPrice?.durationDays ?? 0} days\n\n` +
       `Click the link below to complete your renewal:\n\n` +
       `${payment.authorizationUrl}\n\n` +
       `_Reference: ${payment.reference}_`;
@@ -345,8 +350,14 @@ const sendWelcomeMessage = async (user: any): Promise<void> => {
 };
 
 const sendHelpMenu = async (phoneNumber: string): Promise<void> => {
-  const plansList = Object.values(SUBSCRIPTION_PLANS)
-    .map(plan => `• *${plan.name}* - ₦${(plan.amount / 100).toLocaleString()}/month`)
+  const plans = await getPurchasablePlans();
+  const plansList = plans
+    .map(plan => {
+      const price = plan.defaultPrice;
+      return price
+        ? `• *${plan.name}* - from ₦${(price.amount / 100).toLocaleString()}`
+        : `• *${plan.name}*`;
+    })
     .join('\n');
 
   const message = `*Available Plans*\n\n${plansList}\n\n` +
