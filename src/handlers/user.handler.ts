@@ -6,6 +6,7 @@ import {
   initializePayment,
   initializePlanChange,
   initializeRenewalPayment,
+  disablePaystackSubscription,
   verifyPayment,
   PlanFullError,
   SamePlanError,
@@ -387,6 +388,58 @@ export const renewSubscription = async (req: Request, res: Response): Promise<vo
   } catch (error: any) {
     logger.error('Renewal failed', { error: error.message, subscriptionId: subscription.id });
     res.status(500).json({ error: 'Could not start the renewal. Please try again.' });
+  }
+};
+
+// POST /users/subscriptions/:id/cancel — cancel at period end. Access continues
+// through expiryDate; Paystack is told to stop auto-charging so no further
+// payment is taken. Same end state as the subscription.not_renew webhook, just
+// member-initiated instead of Paystack-initiated. No refund/immediate-revoke
+// path exists — see the cancelAtPeriodEnd field this sets.
+export const cancelSubscription = async (req: Request, res: Response): Promise<void> => {
+  const member = req.member!;
+
+  const subscription = await prisma.subscription.findUnique({ where: { id: req.params.id } });
+  if (!subscription || subscription.userId !== member.id) {
+    res.status(404).json({ error: 'Subscription not found' });
+    return;
+  }
+
+  if (subscription.status !== 'ACTIVE' && subscription.status !== 'GRACE') {
+    res.status(400).json({
+      error: `This subscription has ${subscription.status.toLowerCase()} — there's nothing to cancel`,
+    });
+    return;
+  }
+
+  if (subscription.cancelAtPeriodEnd) {
+    res.status(409).json({ error: 'This subscription is already set to cancel at period end' });
+    return;
+  }
+
+  try {
+    // Fire-and-forget, same as every other call site — disablePaystackSubscription
+    // logs and swallows its own failures rather than throwing.
+    if (subscription.paystackSubscriptionCode && subscription.paystackEmailToken) {
+      await disablePaystackSubscription(
+        subscription.paystackSubscriptionCode,
+        subscription.paystackEmailToken,
+      );
+    }
+
+    const updated = await prisma.subscription.update({
+      where: { id: subscription.id },
+      data: { cancelAtPeriodEnd: true },
+    });
+
+    logger.info('Subscription cancelled by member (at period end)', {
+      subscriptionId: subscription.id,
+      userId: member.id,
+    });
+    res.json({ success: true, cancelAtPeriodEnd: true, expiryDate: updated.expiryDate });
+  } catch (error: any) {
+    logger.error('Cancel failed', { error: error.message, subscriptionId: subscription.id });
+    res.status(500).json({ error: 'Could not cancel your subscription. Please try again.' });
   }
 };
 

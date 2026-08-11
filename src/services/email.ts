@@ -200,19 +200,19 @@ export const sendWelcomeEmail = async (userId: string): Promise<boolean> => {
   }
 
   const text =
-    `${greeting}\n\nWelcome to ZuriCircle — your account is ready.\n\n` +
+    `${greeting}\n\nWelcome to ZuriCircle Network — your account is ready.\n\n` +
     (free?.inviteLink ? `Join our community group: ${free.inviteLink}\n\n` : '') +
     `You can subscribe to a plan any time from your dashboard to unlock the exclusive groups.`;
 
   const html =
-    `<p>${greeting}</p><p>Welcome to ZuriCircle — your account is ready.</p>` +
+    `<p>${greeting}</p><p>Welcome to ZuriCircle Network — your account is ready.</p>` +
     (free?.inviteLink
       ? `<p><a href="${escapeHtml(free.inviteLink)}" style="display:inline-block;padding:12px 20px;` +
         `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Join ${escapeHtml(free.name)}</a></p>`
       : '') +
     `<p>You can subscribe to a plan any time from your dashboard to unlock the exclusive groups.</p>`;
 
-  return sendMail({ to: user.email, subject: 'Welcome to ZuriCircle', html, text });
+  return sendMail({ to: user.email, subject: 'Welcome to ZuriCircle Network', html, text });
 };
 
 // Free-form message from an operator to one subscriber. Replaces the WhatsApp

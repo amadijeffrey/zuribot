@@ -7,6 +7,7 @@ import {
   subscribe,
   changePlan,
   renewSubscription,
+  cancelSubscription,
   updatePassword,
   paymentStatus,
 } from '../handlers/user.handler';
@@ -43,6 +44,9 @@ router.post('/subscribe', userAuthMiddleware, memberActionRateLimiter, subscribe
 router.post('/subscriptions/:id/renew', userAuthMiddleware, memberActionRateLimiter, renewSubscription);
 // Upgrade or downgrade an existing subscription (plan and/or interval).
 router.post('/subscriptions/:id/change', userAuthMiddleware, memberActionRateLimiter, changePlan);
+// Cancel at period end — access continues until expiryDate, Paystack stops
+// auto-charging. No immediate-revoke path.
+router.post('/subscriptions/:id/cancel', userAuthMiddleware, memberActionRateLimiter, cancelSubscription);
 router.post('/change-password', userAuthMiddleware, memberActionRateLimiter, updatePassword);
 
 export default router;

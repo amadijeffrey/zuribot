@@ -388,8 +388,9 @@ const createPaystackSubscription = async (
 };
 
 // Disable the subscription on Paystack's side so they stop auto-retrying the card.
-// Used when an invoice failure is terminal (declined, expired, stolen, fraud, etc.).
-const disablePaystackSubscription = async (
+// Used when an invoice failure is terminal (declined, expired, stolen, fraud, etc.),
+// and by a member-initiated cancellation (see cancelSubscription in user.handler.ts).
+export const disablePaystackSubscription = async (
   subscriptionCode: string,
   emailToken: string,
 ): Promise<boolean> => {
