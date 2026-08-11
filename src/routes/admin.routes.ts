@@ -39,6 +39,7 @@ if (env.NODE_ENV !== 'production') {
 router.get('/payments', adminHandler.getPayments);
 
 // Plans
+router.get('/plans', adminHandler.getPlans);
 router.get('/plans/verify', adminHandler.verifyPlans);
 
 // Manual WhatsApp group removals (WhatsApp's API can't do this for us)

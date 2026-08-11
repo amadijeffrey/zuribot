@@ -11,7 +11,7 @@ import {
 import { verifyPlanConfiguration, runReconciliation } from '../services/payment';
 import { getPendingRemovals, markAccessRevoked } from '../services/removal';
 import { sendCustomEmail, resendGroupLinksEmail } from '../services/email';
-import { resolvePlan } from '../services/plan';
+import { getAllPlans, resolvePlan } from '../services/plan';
 import { SAFE_USER_SELECT } from '../services/user';
 import { logger } from '../utils/logger';
 
@@ -186,6 +186,36 @@ export const runSweep = async (_req: Request, res: Response): Promise<void> => {
   } catch (error: any) {
     logger.error('Admin expiry sweep failed', { error: error.message });
     res.status(500).json({ error: 'Sweep failed' });
+  }
+};
+
+// GET /admin/plans — lightweight list for the subscriptions filter. `code` is
+// what /admin/subscriptions?planId= expects. Retired plans are included, not
+// just purchasable ones: they still have subscribers worth filtering to.
+export const getPlans = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const [plans, counts] = await Promise.all([
+      getAllPlans(),
+      // One groupBy rather than a count per plan. Subscription.planId holds the
+      // plan CODE, not the Plan row's uuid.
+      prisma.subscription.groupBy({ by: ['planId'], _count: true }),
+    ]);
+
+    const subscriberCounts = new Map(counts.map((c) => [c.planId, c._count]));
+
+    res.json({
+      plans: plans.map((plan) => ({
+        code: plan.code,
+        name: plan.name,
+        isActive: plan.isActive,
+        // All statuses, so a filter option isn't hidden just because everyone on
+        // that plan has expired.
+        subscriberCount: subscriberCounts.get(plan.code) ?? 0,
+      })),
+    });
+  } catch (error: any) {
+    logger.error('Admin plan listing failed', { error: error.message });
+    res.status(500).json({ error: 'Could not load plans' });
   }
 };
 
