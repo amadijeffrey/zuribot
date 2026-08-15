@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { env } from '../config/env';
+import { isLocal } from '../config/env';
 import * as adminHandler from '../handlers/admin.handler';
 import * as adminAuthHandler from '../handlers/admin-auth.handler';
 import { authMiddleware } from '../middleware/auth';
@@ -41,10 +41,14 @@ router.post('/users/:id/send-message', asyncHandler(adminHandler.sendMessageToUs
 router.get('/subscriptions', asyncHandler(adminHandler.getSubscriptionsHandler));
 router.post('/subscriptions/run-sweep', asyncHandler(adminHandler.runSweep));
 router.post('/subscriptions/:id/extend', asyncHandler(adminHandler.extendSubscription));
-// Test tooling: mutates real subscription state, so it is never mounted in
-// production. Guarded here rather than inside the handler so the route simply
-// does not exist there.
-if (env.NODE_ENV !== 'production') {
+// Test tooling: mutates real subscription state, so it exists only on a local
+// machine. Guarded here rather than inside the handler so the route simply does
+// not exist anywhere else.
+//
+// Keyed on APP_ENV rather than NODE_ENV: the docker dev stack runs
+// NODE_ENV=production, so this route used to be missing locally, and a staging
+// box running NODE_ENV=development would have exposed it on the internet.
+if (isLocal) {
   router.post(
     '/subscriptions/:id/simulate-payment-failed',
     asyncHandler(adminHandler.simulatePaymentFailed),

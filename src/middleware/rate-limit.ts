@@ -1,27 +1,27 @@
 import rateLimit, { Options } from 'express-rate-limit';
 import { Request } from 'express';
-import { env } from '../config/env';
+import { env, isLocal } from '../config/env';
 import { logger } from '../utils/logger';
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 // Skips rate limiting for local development. Two independent conditions,
-// because the two dev flows look completely different to this process:
+// because the two local flows look different to this process:
 //
 //   • `npm run dev` runs it directly on the host — a request from your machine
-//     genuinely arrives from a loopback address, and NODE_ENV is 'development'.
-//   • `./scripts/dev.sh` runs the docker stack, where NODE_ENV is 'production'
-//     (inherited from docker-compose.yml) and Docker rewrites the source address
-//     to the bridge gateway, so the container never sees 127.0.0.1. Nothing about
-//     the request identifies it as local — only an explicit flag can.
+//     genuinely arrives from a loopback address.
+//   • `./scripts/dev.sh` runs the docker stack, where Docker rewrites the source
+//     address to the bridge gateway, so the container never sees 127.0.0.1.
+//     Nothing about the request identifies it as local — only an explicit flag
+//     can. (The env schema refuses that flag outside APP_ENV=local.)
 //
-// The loopback branch is gated on NODE_ENV so it cannot fire in production. That
-// matters: `trust proxy` makes req.ip come from X-Forwarded-For, and without the
-// gate anyone able to reach the app directly on the Docker network could send
+// The loopback branch is gated on APP_ENV so it cannot fire on a deployed box.
+// That matters: `trust proxy` makes req.ip come from X-Forwarded-For, so without
+// the gate anyone able to reach the app directly could send
 // `X-Forwarded-For: 127.0.0.1` and bypass every limit on the service.
 const skipLocal = (req: Request): boolean => {
   if (env.DISABLE_RATE_LIMIT) return true;
-  return env.NODE_ENV !== 'production' && LOOPBACK.has(req.ip ?? '');
+  return isLocal && LOOPBACK.has(req.ip ?? '');
 };
 
 if (env.DISABLE_RATE_LIMIT) {

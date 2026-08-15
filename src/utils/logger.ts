@@ -1,7 +1,7 @@
 import winston from 'winston';
 import fs from 'fs';
 import path from 'path';
-import { env } from '../config/env';
+import { env, isLocal } from '../config/env';
 import { redactInfoInPlace } from './redact';
 import { getRequestContext } from './request-context';
 
@@ -75,7 +75,9 @@ if (env.LOG_FILE_DIR) {
 }
 
 export const logger = winston.createLogger({
-  level: env.NODE_ENV === 'production' ? 'info' : 'debug',
+  // Verbose on a laptop, quiet on a real deployment. Keyed on APP_ENV so the
+  // docker dev stack (NODE_ENV=production) still gets debug output locally.
+  level: isLocal ? 'debug' : 'info',
   format: logFormat,
   defaultMeta: { service: 'zuribot' },
   transports,

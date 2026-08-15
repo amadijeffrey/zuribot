@@ -13,6 +13,10 @@
 services:
   app:
     environment:
+      # NODE_ENV stays 'production' (inherited from the base file) so this stack
+      # runs the same code paths as a real deployment. APP_ENV is what marks it
+      # as a laptop: debug logging, local rate-limit skip, test routes mounted.
+      APP_ENV: local
       DATABASE_URL: postgresql://zuribot:zuribot@db:5432/zuribot?schema=public&connection_limit=15&pool_timeout=20
       DIRECT_URL: postgresql://zuribot:zuribot@db:5432/zuribot
     ports:
