@@ -26,9 +26,9 @@ const envSchema = z.object({
   PAYSTACK_PUBLIC_KEY: z.string(),
 
   ADMIN_API_KEY: z.string(),
-  JWT_SECRET: optional(z.string().min(32).optional()),
-  JWT_EXPIRES_IN: optional(z.string().min(1).default('2h')),
-  CRON_SECRET: optional(z.string().optional()),
+  JWT_SECRET: z.string().min(32),
+  JWT_EXPIRES_IN: z.string().min(1),
+  CRON_SECRET: z.string().optional(),
 
 
   GRACE_PERIOD_DAYS: z.string().transform(Number).default('3'),
@@ -38,12 +38,24 @@ const envSchema = z.object({
   // by flipping this back on. Inbound bot webhooks are unaffected.
   ENABLE_WHATSAPP_NOTIFICATIONS: z.string().transform(v => v === 'true').default('false'),
 
+  // Local development escape hatch: turns off every rate limiter. Needed because
+  // the docker dev stack runs with NODE_ENV=production and traffic reaches the
+  // container from the Docker gateway, so neither NODE_ENV nor the client IP can
+  // identify it as local. Never set this on a deployed environment.
+  DISABLE_RATE_LIMIT: z.string().transform(v => v === 'true').default('false'),
+
   ENABLE_WEBHOOK_LOGGING: z.string().transform(v => v === 'true').default('true'),
   ENABLE_MESSAGE_LOGGING: z.string().transform(v => v === 'true').default('true'),
   // Comma-separated browser origins allowed to call the API. Validated here so a
   // missing value is visible in config rather than silently blocking every
   // browser request at runtime.
   ALLOWED_ORIGINS: z.string().default(''),
+
+  // Optional directory for on-disk logs. Unset by default: stdout is captured on
+  // every target we deploy to (Vercel natively; Docker's json-file driver on the
+  // VM, which also rotates it). Set this only on a host where stdout is not
+  // collected — the files it enables are size-bounded, see utils/logger.ts.
+  LOG_FILE_DIR: optional(z.string().optional()),
 
   FRONTEND_URL: optional(z.string().url().optional()),
   RESEND_API_KEY: optional(z.string().optional()),

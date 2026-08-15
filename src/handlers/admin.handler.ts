@@ -13,15 +13,24 @@ import { getPendingRemovals, markAccessRevoked } from '../services/removal';
 import { sendCustomEmail, resendGroupLinksEmail } from '../services/email';
 import { getAllPlans, resolvePlan } from '../services/plan';
 import { SAFE_USER_SELECT } from '../services/user';
+import { normalizeMemberId } from '../utils/member-id';
 import { logger } from '../utils/logger';
 
 export const getUsers = async (req: Request, res: Response): Promise<void> => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = parseInt(req.query.limit as string) || 20;
+  const memberId = req.query.memberId as string | undefined;
   const skip = (page - 1) * limit;
+
+  // member_id is unique, so this narrows to at most one row — but it still goes
+  // through the paginated shape rather than a bare object, so the admin UI can
+  // reuse one list renderer whether or not the filter is applied.
+  const where: any = {};
+  if (memberId) where.memberId = normalizeMemberId(memberId);
 
   const [users, total] = await Promise.all([
     prisma.user.findMany({
+      where,
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
@@ -30,7 +39,7 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
         subscriptions: { orderBy: { createdAt: 'desc' }, take: 1 },
       },
     }),
-    prisma.user.count(),
+    prisma.user.count({ where }),
   ]);
 
   res.json({

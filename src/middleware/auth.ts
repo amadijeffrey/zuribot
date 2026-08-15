@@ -2,6 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { env } from '../config/env';
 import { verifyToken } from '../services/admin-auth';
+import { asyncHandler } from './error';
+import { setRequestActor } from '../utils/request-context';
 import { logger } from '../utils/logger';
 
 // Accepts either:
@@ -11,7 +13,10 @@ import { logger } from '../utils/logger';
 // The key path is kept so existing tooling/scripts keep working during the
 // migration. It grants the same access with no attribution, so remove it once
 // the dashboard is the only consumer.
-export const authMiddleware = async (
+// Wrapped at the definition rather than at each of its ~20 mount points: it
+// awaits a database read, so an unwrapped rejection here would crash the process
+// on any transient DB error — and one forgotten wrap would reintroduce that.
+export const authMiddleware = asyncHandler(async (
   req: Request,
   res: Response,
   next: NextFunction
@@ -26,6 +31,7 @@ export const authMiddleware = async (
       return;
     }
     req.admin = admin;
+    setRequestActor(`admin:${admin.id}`);
     next();
     return;
   }
@@ -43,11 +49,12 @@ export const authMiddleware = async (
     return;
   }
 
+  setRequestActor('admin:legacy-shared-key');
   logger.warn('Admin request authenticated with legacy shared key (no identity)', {
     path: req.path,
   });
   next();
-};
+});
 
 const timingSafeEqual = (a: string, b: string): boolean => {
   const bufA = Buffer.from(a);

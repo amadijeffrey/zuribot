@@ -73,6 +73,14 @@ DIRECT_URL="postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabas
 
 `pgbouncer=true` is required on the pooler URL — Prisma disables prepared statements that don't survive transaction-mode pooling.
 
+### Sizing `connection_limit`
+
+`connection_limit=15` is correct **for this VM deployment and only for it**. The value is per `PrismaClient`, and a VM runs exactly one long-lived process holding exactly one client — so the app's ceiling against Supabase is 15 connections no matter how much traffic arrives.
+
+That assumption does not hold on serverless. Each concurrent function instance is its own process with its own client and its own pool of 15, so *N* instances claim *15 × N* connections. A handful of simultaneous users is enough to exhaust the pooler; Prisma then waits `pool_timeout` seconds and throws `P2024`, and requests fail — often with no usable response, because the platform kills the invocation first.
+
+**If you deploy to Vercel or any serverless target, set `connection_limit=1`.** Each instance serves one request at a time, so a larger pool buys nothing and only multiplies the connection count.
+
 ---
 
 ## 3. DNS
@@ -229,13 +237,19 @@ Enable scheduled snapshots in Hetzner/DO — cheap insurance for the whole disk.
 
 ## 9. Monitoring & logs
 
-- **App logs**: `docker compose logs app` (Winston writes to stdout). HTTP server and BullMQ workers share the same process and log stream.
+- **App logs**: `docker compose logs app` — Winston writes to stdout only.
 - **Caddy access logs**: `docker compose logs caddy` (every request with status + latency).
 - **System**: `htop`, `df -h`, `docker stats`.
 - **Uptime check**: configure UptimeRobot / BetterStack to hit `https://yourdomain.com/health` every minute.
 - **Supabase**: dashboard shows DB CPU, connection count, slow queries.
 
-`setup.sh` already configured Docker log rotation, so logs won't fill the disk.
+### Log retention
+
+`setup.sh` configures Docker's json-file driver at 50 MB × 5 files, so the captured stdout stream is capped at 250 MB per container and cannot fill the disk.
+
+Note what that does *not* cover: Docker's rotation applies only to stdout/stderr. Any file the application writes inside its own filesystem is invisible to it. That is why on-disk logging is off unless `LOG_FILE_DIR` is set, and why the files it enables carry their own 20 MB × 5 bound — an unbounded log inside the container's writable layer would grow until the disk filled, with nothing to reclaim it.
+
+Leave `LOG_FILE_DIR` unset here. `docker compose logs` is the supported way to read them.
 
 ---
 
@@ -260,7 +274,7 @@ Enable scheduled snapshots in Hetzner/DO — cheap insurance for the whole disk.
 | `setup.sh` says "log out and re-run" | First-time docker group add | Log out, log back in, re-run |
 | `app` container restart loop | Bad env var or Supabase unreachable | `docker compose logs app`; verify `DATABASE_URL` + Supabase allow-list |
 | `prisma db push` complains about prepared statements | Pooler URL missing `pgbouncer=true` | Add it to `DATABASE_URL`; `db push` itself uses `DIRECT_URL` |
-| `too many connections` | Pool size mismatch | Keep `connection_limit=15`, lower worker concurrency, or upgrade Supabase plan |
+| `too many connections` / Prisma `P2024` | Pool size mismatch, or more than one `PrismaClient` in the process | Keep `connection_limit=15` on the VM (`=1` on serverless — see §2); confirm nothing constructs its own client outside `src/config/database.ts`; or upgrade the Supabase plan |
 | 502 from Caddy | App container down/unhealthy | `docker compose ps`; `docker compose exec app wget -qO- http://localhost:3000/health` |
 | Caddy stuck "obtaining certificate" | DNS not pointed at VM, port 80 blocked, or Cloudflare proxy on | `dig +short yourdomain.com`; check firewalls; grey-cloud the record |
 | Cert re-issued every deploy | `caddy_data` volume not persisting | `docker volume ls` should show `zuribot_caddy_data`; never `docker compose down -v` in prod |

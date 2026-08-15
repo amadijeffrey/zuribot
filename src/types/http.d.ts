@@ -11,6 +11,9 @@ declare module 'http' {
 
 declare module 'express-serve-static-core' {
   interface Request {
+    // Correlation id for this request, set by requestLogger and echoed to the
+    // caller as the X-Request-Id response header.
+    id?: string;
     // Set by authMiddleware when the request carries a valid admin session.
     // Absent on legacy shared-key requests, which have no identity.
     admin?: { id: string; email: string; name: string | null };

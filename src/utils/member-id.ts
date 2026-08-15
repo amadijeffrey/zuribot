@@ -19,6 +19,15 @@ export const generateMemberId = (): string => {
   return PREFIX + out;
 };
 
+// Coerce a member ID as a human typed it into the stored form. IDs are read
+// aloud and written down, so an admin searching for one arrives with stray
+// whitespace, lowercase, or only the six-character code. Normalising here means
+// the lookup stays an exact match on the unique index rather than a scan.
+export const normalizeMemberId = (input: string): string => {
+  const trimmed = input.trim().toUpperCase();
+  return trimmed.startsWith(PREFIX) ? trimmed : PREFIX + trimmed;
+};
+
 // True only when the unique violation is on member_id. A duplicate email or
 // phone number must surface to the caller as a conflict, not be silently retried.
 const isMemberIdCollision = (error: unknown): boolean => {

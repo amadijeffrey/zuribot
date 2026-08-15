@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { runExpirySweep } from '../services/subscription';
 import { runReconciliation } from '../services/payment';
 import { cronAuthMiddleware } from '../middleware/cron-auth';
+import { asyncHandler } from '../middleware/error';
 import { logger } from '../utils/logger';
 
 const router = Router();
@@ -33,7 +34,7 @@ router.use(cronAuthMiddleware);
 //
 // NOTE: keep the expiry sweep disabled until recurring renewals are confirmed
 // working, or it will expire customers Paystack has successfully charged.
-router.get('/sweep', async (req, res) => {
+router.get('/sweep', asyncHandler(async (req, res) => {
   // The full Paystack subscription sync runs by default, which is right for a
   // daily schedule. On an hourly schedule it is wasteful — pass ?full=false on
   // the frequent runs and let one run a day do it.
@@ -48,6 +49,6 @@ router.get('/sweep', async (req, res) => {
     logger.error('Scheduled sweep failed', { error: error.message });
     res.status(500).json({ error: 'Sweep failed' });
   }
-});
+}));
 
 export default router;

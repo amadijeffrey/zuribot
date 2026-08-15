@@ -8,6 +8,11 @@ import { logger } from '../utils/logger';
 // admin edits a plan. Call invalidatePlanCache() to drop it immediately.
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
+// Above this, a plan load is worth surfacing in production rather than only in
+// debug logs. Generous on purpose: the query is small, so anything this slow is
+// the connection to Supabase, not the data.
+const SLOW_PLAN_LOAD_MS = 500;
+
 export interface PlanPriceInfo {
   id: string;
   interval: BillingInterval;
@@ -117,9 +122,24 @@ const load = async (): Promise<ResolvedPlan[]> => {
 export const getAllPlans = async (): Promise<ResolvedPlan[]> => {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.plans;
 
+  const startedAt = Date.now();
   const plans = await load();
+  const durationMs = Date.now() - startedAt;
+
   cache = { plans, at: Date.now() };
-  logger.debug('Plan cache refreshed', { count: plans.length });
+
+  // Covers the whole of load(), which is more than one round trip: the nested
+  // include (prices, benefits -> benefit) is resolved by Prisma as separate
+  // statements rather than a join, so this is the wall-clock cost of ~4 trips to
+  // Supabase — the number that actually matters for request latency.
+  //
+  // Logged at warn above the threshold so a slow database is visible in
+  // production, where the level is 'info' and the debug line below is dropped.
+  if (durationMs > SLOW_PLAN_LOAD_MS) {
+    logger.warn('Plan query slow', { durationMs, count: plans.length });
+  }
+
+  logger.debug('Plan cache refreshed', { count: plans.length, durationMs });
   return plans;
 };
 

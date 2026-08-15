@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../config/database';
+import { asyncHandler } from '../middleware/error';
 import { logger } from '../utils/logger';
 import webhookRoutes from './webhook.routes';
 import paystackRoutes from './paystack.routes';
@@ -17,7 +18,7 @@ router.get('/health', (_req, res) => {
 // Readiness: process can serve traffic — db reachable.
 // 200 if healthy, 503 if down. Use this for deployment smoke tests and
 // uptime checks.
-router.get('/ready', async (_req, res) => {
+router.get('/ready', asyncHandler(async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.status(200).json({
@@ -33,7 +34,7 @@ router.get('/ready', async (_req, res) => {
       checks: { db: 'fail' },
     });
   }
-});
+}));
 
 router.use('/', webhookRoutes);
 router.use('/', paystackRoutes);

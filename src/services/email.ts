@@ -165,12 +165,7 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
               `style="display:inline-block;padding:12px 20px;background:#25D366;color:#fff;` +
               `text-decoration:none;border-radius:6px;">Join ${escapeHtml(g.name)}</a></p>`,
           )
-          .join('') +
-        `<p style="font-size:13px;color:#555;">If a button doesn't work, copy the link:<br>` +
-        groups
-          .map((g) => `${escapeHtml(g.name)}: <a href="${escapeHtml(g.inviteLink)}">${escapeHtml(g.inviteLink)}</a>`)
-          .join('<br>') +
-        `</p>`
+          .join('')
       : '') +
     (perks.length
       ? `<p><strong>Also included:</strong> ${perks.map((p) => escapeHtml(p.name)).join(', ')}</p>`

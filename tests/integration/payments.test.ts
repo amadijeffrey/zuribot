@@ -6,9 +6,9 @@ jest.mock('axios', () => ({
   create: jest.fn(() => mockClient),
 }));
 
-import { prisma } from '../src/config/database';
-import { processWebhookEvent } from '../src/services/payment';
-import { invalidatePlanCache } from '../src/services/plan';
+import { prisma } from '../../src/config/database';
+import { processWebhookEvent } from '../../src/services/payment';
+import { invalidatePlanCache } from '../../src/services/plan';
 import { makeUser, makeTestPlan, chargeSuccess, cleanupAll } from '../helpers';
 
 const PLAN = 'jestplan';

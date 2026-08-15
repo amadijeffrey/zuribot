@@ -1,6 +1,7 @@
 import app from './app';
 import { env } from './config/env';
 import { prisma } from './config/database';
+import { installProcessGuards } from './utils/process-guards';
 import { logger } from './utils/logger';
 
 // A brief network blip on the way up should not kill the process. Prisma
@@ -64,6 +65,11 @@ const startServer = async () => {
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+
+    // Shared with the Vercel entry point — see src/utils/process-guards.ts.
+    // Closing the listener first is specific to this entry point: it lets
+    // in-flight responses finish before Docker's restart policy takes over.
+    installProcessGuards({ onFatal: () => server.close(() => process.exit(1)) });
 
   } catch (error) {
     logger.error('Failed to start server', { error });

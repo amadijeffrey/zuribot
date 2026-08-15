@@ -5,10 +5,10 @@ jest.mock('axios', () => ({
   create: jest.fn(() => mockClient),
 }));
 
-import { prisma } from '../src/config/database';
-import { runExpirySweep } from '../src/services/subscription';
-import { getPendingRemovals } from '../src/services/removal';
-import { checkCapacity, invalidatePlanCache } from '../src/services/plan';
+import { prisma } from '../../src/config/database';
+import { runExpirySweep } from '../../src/services/subscription';
+import { getPendingRemovals } from '../../src/services/removal';
+import { checkCapacity, invalidatePlanCache } from '../../src/services/plan';
 import { makeUser, makeTestPlan, cleanupAll } from '../helpers';
 
 const A = 'jestlifea';   // grants group 1

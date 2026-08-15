@@ -74,11 +74,20 @@ export const initializePayment = async (
   }
 
   // Resume an in-flight checkout instead of minting another payment. Repeated
-  // attempts would otherwise pile up PENDING rows — each one consuming a seat on
-  // a capped plan and creating a redundant Paystack transaction.
+  // attempts would otherwise pile up PENDING rows and create redundant Paystack
+  // transactions.
+  //
+  // `subscriptionId: null` restricts this to other NEW-subscription checkouts.
+  // Renewal and plan-change rows are pre-linked to a subscription, and one for
+  // the same user/plan/price would otherwise match here — handing back a
+  // checkout that handleChargeSuccess routes to applyRenewalCharge, so a member
+  // buying a second subscription would silently have their existing one changed
+  // instead. The renewal and plan-change lookups scope themselves the same way,
+  // by subscription and by which plan they are for.
   const inFlight = await prisma.payment.findFirst({
     where: {
       userId,
+      subscriptionId: null,
       planId,
       planPriceId: price.id,
       status: 'PENDING',
@@ -1159,6 +1168,34 @@ export const initializeRenewalPayment = async (
   const price = await priceForSubscription(subscription.planId, subscription.planPriceId);
   if (!price) throw new Error(`Unknown plan/price: ${subscription.planId}`);
 
+  // Resume an in-flight renewal checkout instead of minting another payment —
+  // same reasoning as initializePayment's inFlight check. Scoped to this
+  // subscription's CURRENT plan/price (not just subscriptionId) so a pending
+  // plan-change payment for the same subscription is never mistaken for one.
+  const inFlight = await prisma.payment.findFirst({
+    where: {
+      subscriptionId,
+      planId: subscription.planId,
+      planPriceId: price.id,
+      status: 'PENDING',
+      authorizationUrl: { not: null },
+      createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (inFlight?.authorizationUrl) {
+    logger.info('Reusing in-flight renewal checkout', {
+      reference: inFlight.reference,
+      subscriptionId,
+    });
+    return {
+      reference: inFlight.reference,
+      authorizationUrl: inFlight.authorizationUrl,
+      accessCode: '',
+    };
+  }
+
   const email =
     subscription.user.email ||
     `${subscription.user.phoneNumber}@whatsapp.placeholder.com`;
@@ -1190,6 +1227,14 @@ export const initializeRenewalPayment = async (
         subscriptionId: subscription.id,
         renewal: true,
       },
+    });
+
+    // Written back so the inFlight check above can find and reuse this row on
+    // a repeat call — without this it would never match (authorizationUrl
+    // stays null forever) and every retry would mint a fresh payment.
+    await prisma.payment.update({
+      where: { reference },
+      data: { authorizationUrl: response.data.data.authorization_url },
     });
 
     return {
@@ -1599,6 +1644,35 @@ export const initializePlanChange = async (
     if (!capacity.hasCapacity) throw new PlanFullError(newPlanId, capacity.limit ?? 0);
   }
 
+  // Resume an in-flight change checkout instead of minting another payment —
+  // same reasoning as initializePayment's inFlight check. Scoped to this
+  // subscription's TARGET plan/price so a pending renewal (or a pending change
+  // to a different plan) for the same subscription is never mistaken for one.
+  const inFlight = await prisma.payment.findFirst({
+    where: {
+      subscriptionId,
+      planId: newPlanId,
+      planPriceId: price.id,
+      status: 'PENDING',
+      authorizationUrl: { not: null },
+      createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (inFlight?.authorizationUrl) {
+    logger.info('Reusing in-flight plan-change checkout', {
+      reference: inFlight.reference,
+      subscriptionId,
+      newPlanId,
+    });
+    return {
+      reference: inFlight.reference,
+      authorizationUrl: inFlight.authorizationUrl,
+      accessCode: '',
+    };
+  }
+
   const email =
     subscription.user.email || `${subscription.user.phoneNumber}@whatsapp.placeholder.com`;
   const reference = `CHG_${newPlanId.toUpperCase()}_${uuidv4().slice(0, 8)}`;
@@ -1636,6 +1710,14 @@ export const initializePlanChange = async (
         interval: price.interval,
         planChange: true,
       },
+    });
+
+    // Written back so the inFlight check above can find and reuse this row on
+    // a repeat call — without this it would never match (authorizationUrl
+    // stays null forever) and every retry would mint a fresh payment.
+    await prisma.payment.update({
+      where: { reference },
+      data: { authorizationUrl: response.data.data.authorization_url },
     });
 
     logger.info('Plan change initialized', {
