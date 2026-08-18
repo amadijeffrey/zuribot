@@ -3,7 +3,7 @@ import helmet from 'helmet';
 import cors from 'cors';
 import { env } from './config/env';
 import routes from './routes';
-import { errorHandler } from './middleware/error';
+import { AppError, errorHandler } from './middleware/error';
 import { requestLogger } from './middleware/request-logger';
 import { logger } from './utils/logger';
 
@@ -52,10 +52,14 @@ app.use(cors({
       callback(null, true)
     } else {
       logger.warn('Blocked by CORS', { origin });
-      callback(new Error('Not allowed by CORS'));
+      // AppError, not a bare Error: the handler treats a bare one as an unexpected
+      // fault and answers 500 with a stack trace. A disallowed origin is a client
+      // problem, so 403 is the honest status — and it keeps a single stale browser
+      // tab from filling the log with error-level stacks.
+      callback(new AppError('Not allowed by CORS', 403));
     }
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
 

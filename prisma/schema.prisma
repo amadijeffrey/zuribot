@@ -38,6 +38,12 @@ model User {
   whyJoin      String?   @map("why_join")
   goal90       String?   @map("goal_90")
 
+  // Stamped the first time sendWelcomeEmail actually sends — not at account
+  // creation. Read (rather than a per-payment isRegistration flag) to decide
+  // which activation email a successful payment triggers, so the right email
+  // fires regardless of which flow/endpoint the payment came through.
+  welcomeEmailSentAt DateTime? @map("welcome_email_sent_at")
+
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 

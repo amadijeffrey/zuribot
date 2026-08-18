@@ -12,7 +12,7 @@ import {
   checkCapacity,
 } from './plan';
 import { sendActivationConfirmation, sendRenewalConfirmation, sendExpiryReminder, moveToGracePeriod, expireSubscription } from './subscription';
-import { sendActivationEmail, sendRenewalEmail, sendRenewalReminderEmail, alertAdmins } from './email';
+import { sendActivationEmail, sendRenewalEmail, sendRenewalReminderEmail, sendWelcomeEmail, alertAdmins } from './email';
 import { redactPaystackData } from '../utils/redact';
 import { logger } from '../utils/logger';
 import { InitializePaymentParams, InitializePaymentResult } from '../types';
@@ -51,7 +51,7 @@ export class PlanFullError extends Error {
 export const initializePayment = async (
   params: InitializePaymentParams
 ): Promise<InitializePaymentResult> => {
-  const { userId, planId, email, channel = 'WHATSAPP', interval } = params;
+  const { userId, planId, email, channel = 'WHATSAPP', interval, origin = 'dashboard' } = params;
   const plan = await resolvePlan(planId);
 
   if (!plan) throw new Error(`Unknown plan: ${planId}`);
@@ -109,10 +109,13 @@ export const initializePayment = async (
   const reference = `SUB_${planId.toUpperCase()}_${uuidv4().slice(0, 8)}`;
 
   // WEB payments send the user back to the frontend success page, which reads
-  // the reference and confirms via GET /users/registration-status.
+  // the reference and confirms via GET /users/payment-status. `origin` rides
+  // along the same way `reference` does — Paystack appends its own params
+  // (trxref) rather than replacing the query string — so /payment/success can
+  // read it straight back off its own URL with no extra API round trip.
   const callbackUrl =
     channel === 'WEB' && env.FRONTEND_URL
-      ? `${env.FRONTEND_URL.replace(/\/$/, '')}/payment/success?reference=${reference}`
+      ? `${env.FRONTEND_URL.replace(/\/$/, '')}/payment/success?reference=${reference}&origin=${origin}`
       : undefined;
 
   try {
@@ -701,7 +704,31 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
     throw err;
   }
 
-  await deliverActivation(payment.channel, payment.userId, payment.planId);
+  // Which email this payment triggers is decided by what's actually happened
+  // to this user, not by which endpoint/flow this specific payment came
+  // through — a member can reach their first successful payment via the
+  // original registration checkout, a retry from /membership-activation/plans,
+  // or (having joined free) their first subscribe from the real dashboard.
+  // All three deserve the same welcome; anything after deserves the regular
+  // per-plan activation email instead. Whichever fires, the group-link
+  // content itself is delivered by sendMembershipActivationEmail once PATCH
+  // /users/edit completes, not from here — see that function's docstring.
+  const user = await prisma.user.findUnique({
+    where: { id: payment.userId },
+    select: { welcomeEmailSentAt: true },
+  });
+
+  if (user?.welcomeEmailSentAt) {
+    await deliverActivation(payment.channel, payment.userId, payment.planId);
+  } else {
+    const sent = await sendWelcomeEmail(payment.userId);
+    if (sent) {
+      await prisma.user.update({
+        where: { id: payment.userId },
+        data: { welcomeEmailSentAt: new Date() },
+      });
+    }
+  }
 };
 
 // charge.success for a Paystack-managed subscription. NOTE: in practice Paystack

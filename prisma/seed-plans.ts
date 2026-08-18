@@ -17,7 +17,7 @@ const prisma = new PrismaClient();
 // Placeholder Paystack codes — replace with real ones before activating.
 const TODO = (slug: string) => `PLN_TODO_${slug}`;
 
-const BENEFITS = [
+export const BENEFITS = [
   {
     code: 'group-wealth',
     type: BenefitType.WHATSAPP_GROUP,
@@ -53,7 +53,25 @@ const BENEFITS = [
   },
 ];
 
-const PLANS = [
+export type PlanSeed = {
+  code: string;
+  name: string;
+  description: string;
+  keywords: string[];
+  maxSubscribers: number | null;
+  isActive: boolean;
+  sortOrder: number;
+  benefits: string[];
+  prices: {
+    interval: BillingInterval;
+    amount: number;
+    durationDays: number;
+    paystackPlanCode: string;
+    isActive: boolean;
+  }[];
+};
+
+const PLANS: PlanSeed[] = [
   {
     // Short-cycle plan for exercising the renewal/expiry cycle in minutes rather
     // than a month. Billed HOURLY on Paystack, so a subscriber is charged every
@@ -152,7 +170,10 @@ const PLANS = [
   },
 ];
 
-async function main() {
+// Applies a plan set to whatever database DATABASE_URL points at. Exported so
+// the Paystack test-mode seed (seed-plans.testmode.ts) reuses this exact logic
+// rather than keeping a second copy that can drift.
+export async function applySeed(plans: PlanSeed[]) {
   const benefitIds = new Map<string, string>();
 
   for (const b of BENEFITS) {
@@ -165,7 +186,7 @@ async function main() {
   }
   console.log(`benefits: ${BENEFITS.length} upserted`);
 
-  for (const p of PLANS) {
+  for (const p of plans) {
     const plan = await prisma.plan.upsert({
       where: { code: p.code },
       update: {
@@ -228,9 +249,20 @@ async function main() {
   }
 }
 
-main()
-  .catch((e) => {
+/** Entry point shared by this file and the test-mode seed. */
+export async function runSeed(plans: PlanSeed[]) {
+  try {
+    await applySeed(plans);
+  } catch (e) {
     console.error(e);
-    process.exit(1);
-  })
-  .finally(() => prisma.$disconnect());
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+// Guarded so importing this module (for BENEFITS / applySeed) does not seed the
+// live plan set as a side effect.
+if (require.main === module) {
+  void runSeed(PLANS);
+}

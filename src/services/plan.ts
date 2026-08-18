@@ -70,51 +70,69 @@ export const getFreeGroupBenefit = async (): Promise<BenefitInfo | null> => {
   return freeBenefitCache;
 };
 
+// Shape returned by load()'s raw query — prices/benefits arrive pre-aggregated
+// as JSON per plan (see below), so no further reshaping is needed beyond what
+// TypeScript can't verify from a raw query: the enum columns come back as
+// plain strings, which is exactly what PlanPriceInfo/BenefitInfo expect.
+type PlanRow = Omit<ResolvedPlan, 'defaultPrice' | 'groupLinks'>;
+
 const load = async (): Promise<ResolvedPlan[]> => {
-  const rows = await prisma.plan.findMany({
-    include: {
-      prices: { orderBy: { amount: 'asc' } },
-      benefits: { include: { benefit: true } },
-    },
-    orderBy: { sortOrder: 'asc' },
-  });
+  // One round trip instead of Prisma's three (plan, plan_prices,
+  // plan_benefits->benefits resolved as separate statements) — prices and
+  // benefits are aggregated to JSON per plan with LATERAL joins, so Postgres
+  // does the grouping instead of the client stitching rows back together.
+  // Benefits are filtered to active ones here, matching the old .filter(); Prices
+  // are NOT filtered — retired prices must still resolve for old renewals.
+  const rows = await prisma.$queryRaw<PlanRow[]>`
+    SELECT
+      p.id,
+      p.code,
+      p.name,
+      p.description,
+      p.keywords,
+      p.max_subscribers AS "maxSubscribers",
+      p.is_active AS "isActive",
+      p.sort_order AS "sortOrder",
+      COALESCE(pr.prices, '[]'::json) AS prices,
+      COALESCE(b.benefits, '[]'::json) AS benefits
+    FROM plans p
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+        json_build_object(
+          'id', pp.id,
+          'interval', pp.interval,
+          'amount', pp.amount,
+          'durationDays', pp.duration_days,
+          'paystackPlanCode', pp.paystack_plan_code,
+          'isActive', pp.is_active
+        ) ORDER BY pp.amount ASC
+      ) AS prices
+      FROM plan_prices pp
+      WHERE pp.plan_id = p.id
+    ) pr ON true
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+        json_build_object(
+          'code', ben.code,
+          'type', ben.type,
+          'name', ben.name,
+          'inviteLink', ben.invite_link
+        )
+      ) AS benefits
+      FROM plan_benefits pb
+      JOIN benefits ben ON ben.id = pb.benefit_id
+      WHERE pb.plan_id = p.id AND ben.is_active = true
+    ) b ON true
+    ORDER BY p.sort_order ASC
+  `;
 
-  return rows.map((p) => {
-    const prices: PlanPriceInfo[] = p.prices.map((pr) => ({
-      id: pr.id,
-      interval: pr.interval,
-      amount: pr.amount,
-      durationDays: pr.durationDays,
-      paystackPlanCode: pr.paystackPlanCode,
-      isActive: pr.isActive,
-    }));
-
-    const benefits: BenefitInfo[] = p.benefits
-      .filter((pb) => pb.benefit.isActive)
-      .map((pb) => ({
-        code: pb.benefit.code,
-        type: pb.benefit.type,
-        name: pb.benefit.name,
-        inviteLink: pb.benefit.inviteLink,
-      }));
-
-    return {
-      id: p.id,
-      code: p.code,
-      name: p.name,
-      description: p.description,
-      keywords: p.keywords,
-      maxSubscribers: p.maxSubscribers,
-      isActive: p.isActive,
-      sortOrder: p.sortOrder,
-      prices,
-      benefits,
-      defaultPrice: prices.find((pr) => pr.isActive) ?? prices[0],
-      groupLinks: benefits
-        .filter((b) => b.type === 'WHATSAPP_GROUP' && b.inviteLink)
-        .map((b) => ({ name: b.name, inviteLink: b.inviteLink as string })),
-    };
-  });
+  return rows.map((p) => ({
+    ...p,
+    defaultPrice: p.prices.find((pr) => pr.isActive) ?? p.prices[0],
+    groupLinks: p.benefits
+      .filter((b) => b.type === 'WHATSAPP_GROUP' && b.inviteLink)
+      .map((b) => ({ name: b.name, inviteLink: b.inviteLink as string })),
+  }));
 };
 
 // All plans, including retired ones — renewals for a retired plan must still
@@ -128,10 +146,9 @@ export const getAllPlans = async (): Promise<ResolvedPlan[]> => {
 
   cache = { plans, at: Date.now() };
 
-  // Covers the whole of load(), which is more than one round trip: the nested
-  // include (prices, benefits -> benefit) is resolved by Prisma as separate
-  // statements rather than a join, so this is the wall-clock cost of ~4 trips to
-  // Supabase — the number that actually matters for request latency.
+  // Covers the whole of load() — a single round trip to Supabase (see its raw
+  // query), so if this is ever slow now, it's the database itself under load,
+  // not query shape.
   //
   // Logged at warn above the threshold so a slow database is visible in
   // production, where the level is 'info' and the debug line below is dropped.

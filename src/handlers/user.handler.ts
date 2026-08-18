@@ -19,7 +19,7 @@ import {
   priceForSubscription,
 } from '../services/plan';
 import { getSubscriptionForPlan } from '../services/subscription';
-import { sendWelcomeEmail } from '../services/email';
+import { sendWelcomeEmail, sendMembershipActivationEmail } from '../services/email';
 import {
   hashPassword,
   verifyCredentials,
@@ -93,21 +93,85 @@ const registerSchema = z.object({
     .trim()
     .regex(/^\+?[1-9]\d{6,14}$/, 'A valid phone number is required'),
   dateOfBirth: z.coerce.date().max(new Date(), { message: 'Date of birth must be in the past' }).optional(),
-  occupation: z.string().trim().max(100).optional(),
-  businessName: z.string().trim().max(150).optional(),
-  sector: z.string().trim().max(100).optional(),
   state: z.string().trim().max(100).optional(),
   country: z.string().trim().max(100).optional(),
-  // Onboarding questions. Generous caps because these are free-text answers,
-  // but bounded so a request body can't be used to bloat the row.
-  source: z.string().trim().max(200).optional(),
-  whyJoin: z.string().trim().max(2000).optional(),
-  goal90: z.string().trim().max(2000).optional(),
+  // Optional plan selection — subscribing at registration is a convenience, not
+  // a requirement; a member can equally join free and subscribe later from the
+  // dashboard. Everything that used to be optional here (occupation, sector,
+  // businessName, source, whyJoin, goal90) is now collected after activation via
+  // PATCH /users/edit instead — see updateProfile.
+  planId: z.string().trim().min(1).optional(),
+  interval: intervalSchema.optional(),
 });
 
+type RegisteredUser = {
+  id: string;
+  memberId: string | null;
+  name: string | null;
+  email: string | null;
+  phoneNumber: string;
+};
+
+// Shared tail for both the "claimed an existing bot row" and "brand new user"
+// paths. With no plan, membership is free and welcomes immediately (unchanged
+// behaviour) — welcomeEmailSentAt is stamped here so handleInitialPayment
+// knows, if this member ever does subscribe later, to send the regular
+// per-plan activation email rather than welcoming them a second time. With a
+// plan, welcoming is deferred to activation — handleInitialPayment stamps it
+// itself once the charge actually succeeds — so nobody gets a "you're in"
+// email before their card has been charged.
+const finishRegistration = async (
+  res: Response,
+  user: RegisteredUser,
+  planId: string | undefined,
+  interval: BillingInterval | undefined,
+): Promise<void> => {
+  if (!planId) {
+    const sent = await sendWelcomeEmail(user.id);
+    if (sent) {
+      await prisma.user.update({ where: { id: user.id }, data: { welcomeEmailSentAt: new Date() } });
+    }
+    res.status(201).json({ token: issueToken(user), user: publicUser(user) });
+    return;
+  }
+
+  try {
+    const payment = await initializePayment({
+      userId: user.id,
+      planId,
+      interval,
+      email: user.email!,
+      channel: 'WEB',
+      origin: 'registration',
+    });
+    res.status(201).json({
+      token: issueToken(user),
+      user: publicUser(user),
+      reference: payment.reference,
+      authorizationUrl: payment.authorizationUrl,
+    });
+  } catch (error: any) {
+    // The account exists either way — a checkout hiccup shouldn't make it look
+    // like registration itself failed. They can subscribe from the dashboard.
+    logger.error('Registration checkout failed', {
+      error: error.message,
+      userId: user.id,
+      planId,
+    });
+    res.status(201).json({
+      token: issueToken(user),
+      user: publicUser(user),
+      checkoutError:
+        'Your account was created, but we could not start checkout. You can subscribe from your dashboard.',
+    });
+  }
+};
+
 // POST /users/register — creates a member account. Membership is free and carries
-// no plan: registering and subscribing are separate steps, so a member can join,
-// receive the free community group, and subscribe later or never.
+// no plan by default: registering and subscribing are separate steps, so a
+// member can join, receive the free community group, and subscribe later or
+// never. planId/interval are an optional convenience for subscribing in the
+// same step.
 export const register = async (req: Request, res: Response): Promise<void> => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -118,7 +182,33 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const { password, ...profile } = parsed.data;
+  const { password, planId, interval, ...profile } = parsed.data;
+
+  // Validated before anything is written: a bad plan/interval should never
+  // create an account and leave the member wondering why checkout never showed.
+  if (planId) {
+    const plan = await resolvePlan(planId);
+    if (!plan || !plan.isActive) {
+      res.status(400).json({ error: `Unknown or unavailable plan: ${planId}` });
+      return;
+    }
+
+    const purchasable = plan.prices.filter((pr) => pr.isActive);
+    if (!interval && purchasable.length > 1) {
+      res.status(400).json({
+        error: 'This plan has multiple billing options — an interval is required',
+        availableIntervals: purchasable.map((pr) => pr.interval),
+      });
+      return;
+    }
+    if (interval && !purchasable.some((pr) => pr.interval === interval)) {
+      res.status(400).json({
+        error: `${interval} is not available for this plan`,
+        availableIntervals: purchasable.map((pr) => pr.interval),
+      });
+      return;
+    }
+  }
 
   try {
     const hash = await hashPassword(password);
@@ -146,9 +236,8 @@ export const register = async (req: Request, res: Response): Promise<void> => {
             },
           }),
         );
-        await sendWelcomeEmail(claimed.id);
         logger.info('Existing bot user claimed their account', { userId: claimed.id });
-        res.status(201).json({ token: issueToken(claimed), user: publicUser(claimed) });
+        await finishRegistration(res, claimed, planId, interval);
         return;
       }
 
@@ -162,11 +251,8 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       prisma.user.create({ data: { ...profile, memberId, passwordHash: hash } }),
     );
 
-    // Membership itself grants the free community group.
-    await sendWelcomeEmail(user.id);
-
     logger.info('Member registered', { userId: user.id });
-    res.status(201).json({ token: issueToken(user), user: publicUser(user) });
+    await finishRegistration(res, user, planId, interval);
   } catch (error: any) {
     logger.error('Registration failed', { error: error.message, email: profile.email });
     res.status(500).json({ error: 'Registration failed. Please try again.' });
@@ -224,6 +310,7 @@ export const me = async (req: Request, res: Response): Promise<void> => {
         planId: s.planId,
         planName: plan?.name,
         interval: price?.interval,
+        amount: price?.amount,
         status: s.status,
         expiryDate: s.expiryDate,
         cancelAtPeriodEnd: s.cancelAtPeriodEnd,
@@ -248,11 +335,66 @@ export const me = async (req: Request, res: Response): Promise<void> => {
   });
 };
 
+const updateProfileSchema = z.object({
+  occupation: z.string().trim().min(1, 'occupation is required').max(100),
+  businessName: z.string().trim().max(150).optional(),
+  sector: z.string().trim().min(1, 'sector is required').max(100),
+  source: z.string().trim().min(1, 'source is required').max(200),
+  whyJoin: z.string().trim().min(1, 'whyJoin is required').max(2000),
+  goal90: z.string().trim().min(1, 'goal90 is required').max(2000),
+});
+
+// PATCH /users/edit — completes the profile info registration deliberately
+// left for after signup (see membership-activation). occupation/sector/
+// source/whyJoin are required — this is the mandatory second half of
+// registration, not an optional nice-to-have — businessName is the only
+// field a member may genuinely have none of (e.g. not currently running a
+// business), so it stays optional.
+export const updateProfile = async (req: Request, res: Response): Promise<void> => {
+  const parsed = updateProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const user = await prisma.user.update({
+    where: { id: req.member!.id },
+    data: parsed.data,
+  });
+
+  logger.info('Member profile updated', { userId: user.id, fields: Object.keys(parsed.data) });
+
+  // This is the actual delivery point for the group invite links a new
+  // member is owed — the welcome email sent at registration only points
+  // here (see sendWelcomeEmail's activationUrl CTA); it never carries the
+  // links itself. Fires every time profile completion succeeds.
+  await sendMembershipActivationEmail(user.id);
+
+  res.json({
+    user: {
+      ...publicUser(user),
+      dateOfBirth: user.dateOfBirth,
+      occupation: user.occupation,
+      businessName: user.businessName,
+      sector: user.sector,
+      state: user.state,
+      country: user.country,
+      source: user.source,
+      whyJoin: user.whyJoin,
+      goal90: user.goal90,
+    },
+  });
+};
+
 const subscribeSchema = z.object({
   planId: z.string().min(1, 'planId is required'),
   // Billing interval, e.g. "ANNUAL". Accepted in any case; normalised to the
   // enum's uppercase form, which is what the rest of the API uses.
   interval: intervalSchema.optional(),
+  // Only 'registration' (passed by /membership-activation/plans, the retry
+  // page for a member who hasn't finished activation yet) means anything
+  // different — see InitializePaymentParams.origin. Defaults to 'dashboard'.
+  origin: z.enum(['registration', 'dashboard']).optional(),
 });
 
 // POST /users/subscribe — starts a payment for the authenticated member.
@@ -268,7 +410,7 @@ export const subscribe = async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const { planId, interval } = parsed.data;
+  const { planId, interval, origin } = parsed.data;
   const member = req.member!;
 
   const plan = await resolvePlan(planId);
@@ -338,6 +480,7 @@ export const subscribe = async (req: Request, res: Response): Promise<void> => {
       interval,
       email: member.email,
       channel: 'WEB',
+      origin,
     });
 
     res.status(201).json({

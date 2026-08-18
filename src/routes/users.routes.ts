@@ -4,6 +4,7 @@ import {
   register,
   login,
   me,
+  updateProfile,
   subscribe,
   changePlan,
   renewSubscription,
@@ -33,6 +34,10 @@ router.post('/login', memberLoginRateLimiter, asyncHandler(login));
 // Called by the frontend success page with the reference from the Paystack
 // redirect, so it cannot require a session.
 router.get('/payment-status', apiRateLimiter, asyncHandler(paymentStatus));
+// Unauthenticated on purpose, unlike /plans below: the membership-apply form's
+// optional plan picker runs before an account (and therefore a session) exists.
+// Same handler, same data — just reachable without a token.
+router.get('/plans/public', apiRateLimiter, asyncHandler(listPlans));
 
 // --- member session required ---
 // Rate limiters run AFTER auth so they can key on the member rather than the IP.
@@ -40,6 +45,11 @@ router.get('/payment-status', apiRateLimiter, asyncHandler(paymentStatus));
 // each listing runs a capacity check per plan.
 router.get('/plans', userAuthMiddleware, memberReadRateLimiter, asyncHandler(listPlans));
 router.get('/me', userAuthMiddleware, memberReadRateLimiter, asyncHandler(me));
+// Completes the profile info registration deliberately left optional —
+// occupation/sector/business/source/whyJoin/goal90. Called from
+// membership-activation after the account (and, if a plan was chosen, its
+// payment) already exists.
+router.patch('/edit', userAuthMiddleware, memberActionRateLimiter, asyncHandler(updateProfile));
 // Subscribing is authenticated: the member is identified by their session, never
 // by an identifier in the request body.
 router.post('/subscribe', userAuthMiddleware, memberActionRateLimiter, asyncHandler(subscribe));
