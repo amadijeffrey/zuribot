@@ -1,6 +1,10 @@
 import { Router } from 'express';
-import { handlePaystackWebhook, handleVerifyPayment } from '../handlers/paystack.handler';
-import { webhookRateLimiter } from '../middleware/rate-limit';
+import {
+  handlePaystackWebhook,
+  handleVerifyPayment,
+  handleManageSubscription,
+} from '../handlers/paystack.handler';
+import { webhookRateLimiter, apiRateLimiter } from '../middleware/rate-limit';
 import { authMiddleware } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error';
 
@@ -15,5 +19,14 @@ router.post('/paystack/webhook', webhookRateLimiter, asyncHandler(handlePaystack
 // Manual payment verification — state-changing (creates Subscription via
 // handleInitialPayment), so require admin auth instead of leaving it open.
 router.get('/payment/verify/:reference', authMiddleware, asyncHandler(handleVerifyPayment));
+
+// Card-update redirect for the grace-period email. Unauthenticated by design —
+// see the handler. Rate limited because it is public and mints a token via an
+// outbound Paystack call on every hit.
+router.get(
+  '/paystack/manage/:subscriptionCode/:emailToken',
+  apiRateLimiter,
+  asyncHandler(handleManageSubscription),
+);
 
 export default router;

@@ -1,8 +1,14 @@
 // Prisma fully mocked — this proves the pricing/entitlement logic, not the DB.
+//
+// load() issues a single raw query whose LATERAL joins aggregate prices and
+// benefits into JSON per plan, so $queryRaw is mocked with rows already in that
+// shape. Two consequences for the fixtures below, both inherited from the SQL:
+// benefits arrive FLAT (no `{ benefit: ... }` join-table nesting), and inactive
+// ones are filtered out by the query, so they never appear here at all.
 const db = {
-  plan: { findMany: jest.fn(), findUnique: jest.fn() },
+  $queryRaw: jest.fn(),
   benefit: { findUnique: jest.fn() },
-  subscription: { count: jest.fn() },
+  subscription: { count: jest.fn(), findMany: jest.fn() },
   payment: { findMany: jest.fn() },
 };
 jest.mock('../../src/config/database', () => ({ prisma: db }));
@@ -21,7 +27,7 @@ const planRow = (over: any = {}) => ({
   id: 'p1', code: 'premium', name: 'Premium', description: null, keywords: [],
   maxSubscribers: null, isActive: true, sortOrder: 1,
   prices: [price('MONTHLY', 500000, 30), price('ANNUAL', 5000000, 365)],
-  benefits: [{ benefit: { code: 'g1', type: 'WHATSAPP_GROUP', name: 'Group 1', inviteLink: 'https://x', isActive: true } }],
+  benefits: [{ code: 'g1', type: 'WHATSAPP_GROUP', name: 'Group 1', inviteLink: 'https://x' }],
   ...over,
 });
 
@@ -29,7 +35,7 @@ beforeEach(() => { jest.clearAllMocks(); invalidatePlanCache(); });
 
 describe('plan resolution', () => {
   it('exposes only plans that are active AND have an active price', async () => {
-    db.plan.findMany.mockResolvedValue([
+    db.$queryRaw.mockResolvedValue([
       planRow(),
       planRow({ id: 'p2', code: 'retired', isActive: false }),
       planRow({ id: 'p3', code: 'nopricing', prices: [price('MONTHLY', 1, 30, false)] }),
@@ -39,15 +45,17 @@ describe('plan resolution', () => {
   });
 
   it('still resolves a retired plan so existing subscribers can renew', async () => {
-    db.plan.findMany.mockResolvedValue([planRow({ code: 'retired', isActive: false })]);
+    db.$queryRaw.mockResolvedValue([planRow({ code: 'retired', isActive: false })]);
     expect(await resolvePlan('retired')).toBeDefined();
   });
 
   it('only surfaces group links that actually have a URL', async () => {
-    db.plan.findMany.mockResolvedValue([planRow({ benefits: [
-      { benefit: { code: 'a', type: 'WHATSAPP_GROUP', name: 'A', inviteLink: 'https://a', isActive: true } },
-      { benefit: { code: 'b', type: 'WHATSAPP_GROUP', name: 'B', inviteLink: null, isActive: true } },
-      { benefit: { code: 'c', type: 'EVENT_ACCESS', name: 'VIP', inviteLink: null, isActive: true } },
+    db.$queryRaw.mockResolvedValue([planRow({ benefits: [
+      { code: 'a', type: 'WHATSAPP_GROUP', name: 'A', inviteLink: 'https://a' },
+      // A group benefit with no link configured — must not become a groupLink,
+      // but must still be listed as an entitlement.
+      { code: 'b', type: 'WHATSAPP_GROUP', name: 'B', inviteLink: null },
+      { code: 'c', type: 'EVENT_ACCESS', name: 'VIP', inviteLink: null },
     ]})]);
     const plan = await resolvePlan('premium');
     expect(plan!.groupLinks).toHaveLength(1);
@@ -56,7 +64,7 @@ describe('plan resolution', () => {
 });
 
 describe('pricing', () => {
-  beforeEach(() => db.plan.findMany.mockResolvedValue([planRow()]));
+  beforeEach(() => db.$queryRaw.mockResolvedValue([planRow()]));
 
   it('charges the interval actually purchased', async () => {
     const p = await priceForSubscription('premium', 'price-ANNUAL');
@@ -78,14 +86,14 @@ describe('pricing', () => {
 
 describe('capacity', () => {
   it('treats an uncapped plan as always available without querying', async () => {
-    db.plan.findMany.mockResolvedValue([planRow({ maxSubscribers: null })]);
+    db.$queryRaw.mockResolvedValue([planRow({ maxSubscribers: null })]);
     const cap = await checkCapacity('premium');
     expect(cap.hasCapacity).toBe(true);
     expect(db.subscription.count).not.toHaveBeenCalled();
   });
 
   it('counts a member with several pending checkouts as one seat', async () => {
-    db.plan.findMany.mockResolvedValue([planRow({ maxSubscribers: 100 })]);
+    db.$queryRaw.mockResolvedValue([planRow({ maxSubscribers: 100 })]);
     db.subscription.count.mockResolvedValue(10);
     // distinct: ['userId'] — five rows collapse to two members.
     db.payment.findMany.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
@@ -97,7 +105,7 @@ describe('capacity', () => {
   });
 
   it('reports no capacity once the limit is reached', async () => {
-    db.plan.findMany.mockResolvedValue([planRow({ maxSubscribers: 2 })]);
+    db.$queryRaw.mockResolvedValue([planRow({ maxSubscribers: 2 })]);
     db.subscription.count.mockResolvedValue(2);
     db.payment.findMany.mockResolvedValue([]);
     const cap = await checkCapacity('premium');

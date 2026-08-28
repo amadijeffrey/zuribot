@@ -98,6 +98,11 @@ const envSchema = z.object({
   // collected — the files it enables are size-bounded, see utils/logger.ts.
   LOG_FILE_DIR: optional(z.string().optional()),
 
+  // Public base URL of THIS api, used to build links we send to members (the
+  // card-update redirect in the grace email). Distinct from FRONTEND_URL, which
+  // points at the member-facing site.
+  API_BASE_URL: optional(z.string().url().optional()),
+
   FRONTEND_URL: optional(z.string().url().optional()),
   RESEND_API_KEY: optional(z.string().optional()),
   EMAIL_FROM: optional(z.string().optional()),
@@ -132,6 +137,9 @@ const envSchema = z.object({
 
     // Checkout redirects back here after payment.
     require('FRONTEND_URL', 'payment callbacks would have nowhere to return to');
+
+    // Links we email to members are built from this.
+    require('API_BASE_URL', 'the card-update link in the grace email could not be built');
 
     if (cfg.DISABLE_RATE_LIMIT) {
       ctx.addIssue({

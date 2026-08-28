@@ -251,6 +251,21 @@ Note what that does *not* cover: Docker's rotation applies only to stdout/stderr
 
 Leave `LOG_FILE_DIR` unset here. `docker compose logs` is the supported way to read them.
 
+### Watching the scheduled sweep
+
+The sweep is the **only** path that revokes access: `invoice.payment_failed` moves a subscription to GRACE, and only `runExpirySweep` moves GRACE to EXPIRED. If it silently stops, members past expiry keep their access indefinitely and nothing else in the system notices.
+
+Two detectors, because one is not enough:
+
+1. **Resumed after a gap** — a successful run records `job_runs.cron-sweep` and alerts the admins if the previous success was more than 48h earlier. This cannot fire while the sweep is still dead, since nothing is running to check.
+2. **Still dead** — `GET /ready` reports it, which is why the uptime monitor above is the real safety net:
+
+```json
+{ "checks": { "db": "ok", "sweep": "stale" }, "sweepLastSuccessAt": "2026-08-25T03:00:12.001Z" }
+```
+
+Configure the monitor to assert on `checks.sweep`, not just the HTTP status. The status stays 200 deliberately — a stale sweep does not mean the process cannot serve traffic, and 503ing would pull a healthy instance out of a load balancer for a scheduling problem.
+
 ---
 
 ## 10. Security checklist before going live
@@ -264,6 +279,8 @@ Leave `LOG_FILE_DIR` unset here. `docker compose logs` is the supported way to r
 - [ ] TLS works (`curl -I https://yourdomain.com`).
 - [ ] Webhooks in Meta + Paystack point to the HTTPS domain.
 - [ ] Fail2ban active (`sudo fail2ban-client status sshd`).
+- [ ] `CRON_SECRET` set, and the scheduled sweep actually runs (see §9).
+- [ ] At least one **real, deliverable** address in the `admins` table — alerts go to every active row and nowhere else. Test databases are often seeded with unroutable fixtures (`@example.com`, `.test`), and a bounced alert is logged but never surfaced.
 
 ---
 

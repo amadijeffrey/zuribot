@@ -76,6 +76,44 @@ const TEST_PLANS: PlanSeed[] = [
     ],
   },
   {
+    // >>> REPLACE paystackPlanCode AND amount with the weekly plan you created
+    // on the Paystack dashboard, then re-run this seed. <<<
+    //
+    // Exists for one reason: Paystack does not emit invoice.create /
+    // invoice.update for hourly plans, only for weekly and longer. So the two
+    // hourly plans above can never exercise handleInvoiceUpdate — which is the
+    // renewal path this account actually receives in production, and the one
+    // path never observed end to end.
+    //
+    // Weekly is the shortest interval that produces those events, so a renewal
+    // arrives in seven days rather than a month.
+    //
+    // Throwaway: to retire it, set isActive to false here and re-run. The seed
+    // upserts and never deletes, so the row stays and any subscription created
+    // during testing still resolves its plan at renewal.
+    code: 'testweekly',
+    name: 'ZCN test (weekly)',
+    description: 'Weekly-billed test plan — exercises the invoice.update renewal path',
+    keywords: [],
+    maxSubscribers: null,
+    isActive: true,
+    sortOrder: 12,
+    benefits: ['group-health'],
+    prices: [
+      {
+        interval: BillingInterval.WEEKLY,
+        // MUST equal the Paystack plan amount exactly. A local amount above the
+        // charged amount makes applyRecurringRenewalToSubscription refuse the
+        // renewal and alert instead of extending — a silent no-op that looks
+        // exactly like the bug this plan exists to rule out.
+        amount: 50_000, // NGN 500.00
+        durationDays: 7,
+        paystackPlanCode: 'PLN_fxqtcg6lmp4mma4',
+        isActive: true,
+      },
+    ],
+  },
+  {
     // "ZCN Wealth" — NGN 5,000.00, monthly.
     code: 'wealth',
     name: 'Wealth Plan',

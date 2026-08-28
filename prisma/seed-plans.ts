@@ -14,28 +14,33 @@ import { PrismaClient, BillingInterval, BenefitType } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
-// Placeholder Paystack codes — replace with real ones before activating.
-const TODO = (slug: string) => `PLN_TODO_${slug}`;
-
 export const BENEFITS = [
   {
     code: 'group-wealth',
     type: BenefitType.WHATSAPP_GROUP,
     name: 'Wealth Group',
-    inviteLink: 'https://chat.whatsapp.com/IpXuZdgcQnT2R3qhQavmYz?s=sh&p=a&ilr=1',
+    inviteLink: 'https://chat.whatsapp.com/D8AMmpcI1usH5Glu6Oq1zm',
   },
   {
     code: 'group-health',
     type: BenefitType.WHATSAPP_GROUP,
     name: 'Health Group',
-    inviteLink: 'https://chat.whatsapp.com/JcCTGFHk5qD0SBBg5vPu2D?s=sh&p=a&ilr=1',
+    inviteLink: 'https://chat.whatsapp.com/CSSdJsiVmCLIZjW87ySMBX',
   },
-  // Premium's five groups — links are placeholders.
-  ...[1, 2, 3, 4, 5].map((n) => ({
-    code: `group-premium-${n}`,
+  // Premium's five groups. Apex references these same rows rather than
+  // duplicating them, so a link only ever needs changing here.
+  //
+  // `name` is what appears on the join button in the activation email.
+  ...[
+    { name: 'ZCN SME Circle', inviteLink: 'https://chat.whatsapp.com/CXbl2qHuYdfEQ7HsTdv31D' },
+    { name: 'ZCN Accelerator Circle', inviteLink: 'https://chat.whatsapp.com/B4wzmLd1FRx6CJggBcSeyp' },
+    { name: 'ZCN Tech Circle', inviteLink: 'https://chat.whatsapp.com/LYtlMBtBo97B5HTkw0nnBW' },
+    { name: 'ZCN New Mum Circle', inviteLink: 'https://chat.whatsapp.com/C72ugmO5mhiLmhCUq2L9Kq' },
+    { name: "ZCN Founder's Circle", inviteLink: 'https://chat.whatsapp.com/I9o9a8PxqWUKd1qajRZ329' },
+  ].map((g, i) => ({
+    code: `group-premium-${i + 1}`,
     type: BenefitType.WHATSAPP_GROUP,
-    name: `Premium Group ${n}`,
-    inviteLink: null,
+    ...g,
   })),
   {
     // Granted to every member on registration — deliberately NOT attached to any
@@ -50,6 +55,16 @@ export const BENEFITS = [
     type: BenefitType.EVENT_ACCESS,
     name: 'Apex VIP Event Access',
     inviteLink: null,
+  },
+  {
+    // Hosted in Supabase Storage (public bucket) rather than committed to the
+    // repo: serverless bundles do not reliably include files read at runtime,
+    // and this way the worksheet can be revised without a deploy.
+    code: 'doc-90day-worksheet',
+    type: BenefitType.DOCUMENT,
+    name: '90-Day Execution Track & Goal-Bursting Worksheet',
+    inviteLink:
+      'https://cuykzhdgcfqhnmkmisox.supabase.co/storage/v1/object/public/documents/90-day-goalbursting-worksheet.docx',
   },
 ];
 
@@ -73,28 +88,6 @@ export type PlanSeed = {
 
 const PLANS: PlanSeed[] = [
   {
-    // Short-cycle plan for exercising the renewal/expiry cycle in minutes rather
-    // than a month. Billed HOURLY on Paystack, so a subscriber is charged every
-    // hour until the subscription is disabled. Shares the real Health group.
-    code: 'testhealth',
-    name: 'Test Health Plan (hourly)',
-    description: 'Hourly-billed test plan — exercises renewal and expiry quickly',
-    keywords: [],
-    maxSubscribers: null,
-    isActive: true,
-    sortOrder: 10,
-    benefits: ['group-health'],
-    prices: [
-      {
-        interval: BillingInterval.HOURLY,
-        amount: 50_000,
-        durationDays: 1 / 24,
-        paystackPlanCode: 'PLN_azvce33l103g6db',
-        isActive: true,
-      },
-    ],
-  },
-  {
     code: 'wealth',
     name: 'Wealth Plan',
     description: 'Access to Wealth building tips and exclusive group',
@@ -106,9 +99,9 @@ const PLANS: PlanSeed[] = [
     prices: [
       {
         interval: BillingInterval.MONTHLY,
-        amount: 50_000,
+        amount: 25_000, // NGN 250.00 — "ZCN Wealth" on Paystack
         durationDays: 30,
-        paystackPlanCode: 'PLN_aj0rq5xto2cod3i',
+        paystackPlanCode: 'PLN_fgu4k1uhkjgvrum',
         isActive: true,
       },
     ],
@@ -125,9 +118,9 @@ const PLANS: PlanSeed[] = [
     prices: [
       {
         interval: BillingInterval.MONTHLY,
-        amount: 30_000,
+        amount: 25_000, // NGN 250.00 — "ZCN Health" on Paystack
         durationDays: 30,
-        paystackPlanCode: 'PLN_rvnrbsb7p11efzo',
+        paystackPlanCode: 'PLN_acn3k0dgfyg7uw2',
         isActive: true,
       },
     ],
@@ -138,13 +131,20 @@ const PLANS: PlanSeed[] = [
     description: 'Access to all five premium groups',
     keywords: ['JOIN PREMIUM', 'PREMIUM'],
     maxSubscribers: null,
-    isActive: false, // no Paystack codes yet
+    isActive: true,
     sortOrder: 3,
-    benefits: ['group-premium-1', 'group-premium-2', 'group-premium-3', 'group-premium-4', 'group-premium-5'],
+    benefits: ['group-premium-1', 'group-premium-2', 'group-premium-3', 'group-premium-4', 'group-premium-5', 'doc-90day-worksheet'],
     prices: [
-      { interval: BillingInterval.MONTHLY, amount: 500_000, durationDays: 30, paystackPlanCode: TODO('PREMIUM_MONTHLY'), isActive: false },
-      { interval: BillingInterval.SEMIANNUAL, amount: 3_000_000, durationDays: 180, paystackPlanCode: TODO('PREMIUM_SEMIANNUAL'), isActive: false },
-      { interval: BillingInterval.ANNUAL, amount: 5_000_000, durationDays: 365, paystackPlanCode: TODO('PREMIUM_ANNUAL'), isActive: false },
+      // Amounts mirror Paystack EXACTLY. applyRecurringRenewalToSubscription
+      // refuses to extend when the charge lands below the local price, so a
+      // local amount even slightly high turns every renewal into a silent
+      // no-op that alerts instead of granting time.
+      { interval: BillingInterval.MONTHLY, amount: 50_000, durationDays: 30, paystackPlanCode: 'PLN_jw9nvc99wtbdg5c', isActive: true },
+      { interval: BillingInterval.SEMIANNUAL, amount: 30_000, durationDays: 180, paystackPlanCode: 'PLN_v8ruhzvwbn02nym', isActive: true },
+      // NOTE: annual is priced the same as monthly on Paystack (NGN 500). Copied
+      // verbatim rather than "corrected" — the local value must match the plan
+      // that actually gets charged. Fix it on Paystack first if it is wrong.
+      { interval: BillingInterval.ANNUAL, amount: 50_000, durationDays: 365, paystackPlanCode: 'PLN_o2cg591162tdh18', isActive: true },
     ],
   },
   {
@@ -153,7 +153,7 @@ const PLANS: PlanSeed[] = [
     description: 'Everything in Premium, plus the Health and Wealth groups and VIP event access',
     keywords: ['JOIN APEX', 'APEX'],
     maxSubscribers: 100,
-    isActive: false, // no Paystack codes yet
+    isActive: true,
     sortOrder: 4,
     // Apex is a superset: every Premium group, both standalone groups, and the
     // event. These reference the SAME benefit rows the other plans use, so a
@@ -163,9 +163,9 @@ const PLANS: PlanSeed[] = [
       'group-health', 'group-wealth', 'event-apex-vip',
     ],
     prices: [
-      { interval: BillingInterval.MONTHLY, amount: 1_200_000, durationDays: 30, paystackPlanCode: TODO('APEX_MONTHLY'), isActive: false },
-      { interval: BillingInterval.SEMIANNUAL, amount: 6_000_000, durationDays: 180, paystackPlanCode: TODO('APEX_SEMIANNUAL'), isActive: false },
-      { interval: BillingInterval.ANNUAL, amount: 10_000_000, durationDays: 365, paystackPlanCode: TODO('APEX_ANNUAL'), isActive: false },
+      { interval: BillingInterval.MONTHLY, amount: 12_000, durationDays: 30, paystackPlanCode: 'PLN_087swkc416kcfth', isActive: true },
+      { interval: BillingInterval.SEMIANNUAL, amount: 60_000, durationDays: 180, paystackPlanCode: 'PLN_qj75sl13c2spc1f', isActive: true },
+      { interval: BillingInterval.ANNUAL, amount: 100_000, durationDays: 365, paystackPlanCode: 'PLN_qstzg5wo2ojzgs3', isActive: true },
     ],
   },
 ];

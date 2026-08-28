@@ -189,7 +189,9 @@ export const simulatePaymentFailed = async (req: Request, res: Response): Promis
 // Idempotent, so it is safe to run alongside a scheduled sweep.
 export const runSweep = async (_req: Request, res: Response): Promise<void> => {
   try {
-    const result = await runExpirySweep();
+    // The manual trigger keeps the full behaviour, including ACTIVE→GRACE,
+    // which the scheduled run no longer performs.
+    const result = await runExpirySweep({ includeGraceTransition: true });
     logger.info('Expiry sweep run', { ...result, adminAction: true });
     res.json({ success: true, ...result });
   } catch (error: any) {

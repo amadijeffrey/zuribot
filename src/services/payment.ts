@@ -425,6 +425,35 @@ export const disablePaystackSubscription = async (
 // Fetch the full subscription from Paystack. Needed on invoice.payment_failed
 // because Paystack does NOT include the decline reason in that webhook payload —
 // it lives on the subscription's `most_recent_invoice` object instead.
+// Paystack-hosted page where a customer can replace the card bound to a
+// subscription. This is the ONLY thing that fixes recurring billing after a
+// decline: paying through our own renewal flow extends access but leaves the
+// failed card attached to the Paystack subscription, so the next cycle fails
+// again.
+//
+// The returned token expires in ~24h, so mint it when it is about to be used
+// rather than storing it. Never throws — it is called from the notification path
+// and a missing link must degrade the email, not lose it.
+export const getSubscriptionManageLink = async (
+  subscriptionCode: string,
+): Promise<string | null> => {
+  try {
+    // Shorter than the shared 15s: this is a convenience link on a redirect the
+    // member is waiting on, so failing fast beats making them stare at a blank
+    // tab. The caller degrades gracefully on null.
+    const { data } = await paystackClient.get(`/subscription/${subscriptionCode}/manage/link`, {
+      timeout: 5000,
+    });
+    return data?.data?.link ?? null;
+  } catch (error: any) {
+    logger.warn('Could not generate Paystack manage-subscription link', {
+      subscriptionCode,
+      error: error.response?.data || error.message,
+    });
+    return null;
+  }
+};
+
 const fetchPaystackSubscription = async (
   subscriptionCode: string,
 ): Promise<any | null> => {
@@ -1465,13 +1494,30 @@ const handleInvoicePaymentFailed = async (data: any): Promise<void> => {
     return;
   }
 
-  // Insufficient-funds failures are transient — Paystack will auto-retry and a
-  // future recurring charge.success will move this sub back to ACTIVE. Anything
-  // else (card declined, expired, stolen, fraud, etc.) is treated as terminal.
+  // GRACE is the intended outcome for essentially every failure, and the
+  // terminal branch below is a rarely-taken safety valve. Deliberate, because
+  // the two mistakes are not symmetrical:
+  //
+  //   • Wrongly GRACE: the member keeps access for GRACE_PERIOD_DAYS, Paystack
+  //     keeps retrying, and the sweep expires them if nothing recovers.
+  //   • Wrongly terminal: access is revoked immediately AND
+  //     disablePaystackSubscription stops the retries, so a card that would have
+  //     worked on the next attempt never gets one. Unrecoverable without the
+  //     member re-subscribing from scratch.
   //
   // Paystack does NOT put the decline reason in the invoice.payment_failed
-  // payload, so fetch the subscription and read most_recent_invoice.description
+  // payload, so the reason is fetched from most_recent_invoice.description
   // (e.g. "Insufficient funds", "Card expired", "Bank declined the transaction").
+  // Observed in practice: that field comes back null for at least some declines
+  // — a live fraud-system rejection produced description: null on both the
+  // webhook and the API — so `reason` is frequently unresolved and this lands on
+  // GRACE regardless of the underlying cause. The decline reason IS available on
+  // the transaction (GET /transaction/verify/:reference, gateway_response), if a
+  // future change ever needs to tell these apart.
+  //
+  // Consequence worth knowing: expiry is now driven almost entirely by the
+  // scheduled sweep rather than by this handler. That makes the sweep the single
+  // path that revokes access — see the staleness alert in cron.routes.ts.
   const paystackSub = await fetchPaystackSubscription(subscriptionCode);
   const invoice = paystackSub?.most_recent_invoice;
 
@@ -1538,6 +1584,7 @@ const INTERVAL_DAYS: Record<string, number> = {
 const EXPECTED_PAYSTACK_INTERVAL: Record<string, string> = {
   HOURLY: 'hourly',
   DAILY: 'daily',
+  WEEKLY: 'weekly',
   MONTHLY: 'monthly',
   SEMIANNUAL: 'biannually',
   ANNUAL: 'annually',

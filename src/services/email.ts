@@ -58,6 +58,14 @@ const sendMail = async ({ to, subject, html, text }: SendMailArgs): Promise<bool
 const escapeHtml = (v: unknown): string =>
   String(v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
 
+// Recipients for every operator email. The admins table IS the distribution
+// list — there is no separate alert address — so an empty result means alerts
+// go nowhere, which is why callers log rather than fail silently.
+const activeAdminEmails = async (): Promise<string[]> => {
+  const admins = await prisma.admin.findMany({ where: { isActive: true }, select: { email: true } });
+  return admins.map((a) => a.email);
+};
+
 // Emails every active admin. Never throws — an alert is itself an error path,
 // and failing to deliver it must not mask the original problem or break the
 // flow that raised it.
@@ -66,10 +74,7 @@ export const notifyAdmins = async (
   context: Record<string, unknown> = {},
 ): Promise<void> => {
   try {
-    const admins = await prisma.admin.findMany({
-      where: { isActive: true },
-      select: { email: true },
-    });
+    const admins = await activeAdminEmails();
 
     if (admins.length === 0) {
       logger.warn('No admin alert recipients configured — alert not emailed', { subject });
@@ -87,8 +92,8 @@ export const notifyAdmins = async (
         : '');
 
     await Promise.all(
-      admins.map((a) =>
-        sendMail({ to: a.email, subject: `[ZuriBot alert] ${subject}`, text, html }),
+      admins.map((email) =>
+        sendMail({ to: email, subject: `[ZuriBot alert] ${subject}`, text, html }),
       ),
     );
   } catch (error: any) {
@@ -182,6 +187,41 @@ const planCopyToHtml = (copy: PlanActivationCopy): string => {
   );
 };
 
+// Documents a plan entitles the member to, rendered as download buttons.
+//
+// Without this a DOCUMENT benefit would only be NAMED in the "Also included"
+// line alongside non-deliverable perks, so the member would be told the
+// worksheet exists and never given it. Links rather than attaches: the file is
+// hosted, so the email stays small and the member always gets the current
+// version rather than whatever was attached the day they joined.
+interface DocumentBenefit {
+  name: string;
+  inviteLink: string;
+}
+
+const documentBenefits = (benefits: { type: string; name: string; inviteLink: string | null }[]) =>
+  benefits.filter((b): b is DocumentBenefit & { type: string } => b.type === 'DOCUMENT' && !!b.inviteLink);
+
+const documentsToText = (docs: DocumentBenefit[]): string =>
+  docs.length
+    ? docs.map((d) => `Download the worksheet — ${d.name}:\n${d.inviteLink}`).join('\n\n') +
+      '\n\n'
+    : '';
+
+const documentsToHtml = (docs: DocumentBenefit[]): string =>
+  docs.length
+    ? docs
+        .map(
+          (d) =>
+            // The document's full name already sits above it in the plan copy, so
+            // the button says what it does rather than repeating the title.
+            `<p style="margin:8px 0;"><a href="${escapeHtml(d.inviteLink)}" ` +
+            `style="display:inline-block;padding:12px 20px;background:#111;color:#fff;` +
+            `text-decoration:none;border-radius:6px;">Download the worksheet</a></p>`,
+        )
+        .join('')
+    : '';
+
 export const sendActivationEmail = async (userId: string, planId: string): Promise<void> => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user?.email) {
@@ -198,7 +238,12 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
 
   const groups = plan?.groupLinks ?? [];
   // Perks that aren't a joinable link (the Apex VIP event) — mentioned, not linked.
-  const perks = (plan?.benefits ?? []).filter((b) => b.type !== 'WHATSAPP_GROUP');
+  // Documents are delivered as their own buttons below, so they must not also
+  // appear in the "Also included" name list.
+  const docs = documentBenefits(plan?.benefits ?? []);
+  const perks = (plan?.benefits ?? []).filter(
+    (b) => b.type !== 'WHATSAPP_GROUP' && b.type !== 'DOCUMENT',
+  );
 
   if (groups.length === 0) {
     // Paid, but we have nothing to deliver — the plan's invite links are unset.
@@ -224,6 +269,7 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
         groups.map((g, i) => `${i + 1}. ${g.name}: ${g.inviteLink}`).join('\n') +
         '\n\n'
       : '') +
+    documentsToText(docs) +
     (perks.length ? `Also included: ${perks.map((p) => p.name).join(', ')}\n\n` : '') +
     `Thank you for subscribing.`;
 
@@ -243,6 +289,7 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
           )
           .join('')
       : '') +
+    documentsToHtml(docs) +
     (perks.length
       ? `<p><strong>Also included:</strong> ${perks.map((p) => escapeHtml(p.name)).join(', ')}</p>`
       : '') +
@@ -281,7 +328,10 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
       if (!groups.some((existing) => existing.inviteLink === g.inviteLink)) groups.push(g);
     }
   }
-  const perks = plans.flatMap((p) => p.benefits.filter((b) => b.type !== 'WHATSAPP_GROUP'));
+  const docs = documentBenefits(plans.flatMap((p) => p.benefits));
+  const perks = plans.flatMap((p) =>
+    p.benefits.filter((b) => b.type !== 'WHATSAPP_GROUP' && b.type !== 'DOCUMENT'),
+  );
 
   if (groups.length === 0) {
     // Everyone gets at least the free group — this means it's unconfigured.
@@ -318,6 +368,7 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
         groups.map((g, i) => `${i + 1}. ${g.name}: ${g.inviteLink}`).join('\n') +
         '\n\n'
       : '') +
+    documentsToText(docs) +
     (perks.length ? `Also included: ${perks.map((p) => p.name).join(', ')}\n\n` : '') +
     `Welcome aboard.`;
 
@@ -342,6 +393,7 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
           )
           .join('')
       : '') +
+    documentsToHtml(docs) +
     (perks.length
       ? `<p><strong>Also included:</strong> ${perks.map((p) => escapeHtml(p.name)).join(', ')}</p>`
       : '') +
@@ -525,17 +577,69 @@ export const sendGracePeriodEmail = async (userId: string, planId: string): Prom
   const greeting = user.name ? `Hi ${user.name},` : 'Hi,';
   const subject = `Your ${plan?.name} subscription has expired`;
 
+  // Renewing happens behind a session, so the CTA points at login rather than
+  // straight at a renewal route. Omitted entirely when FRONTEND_URL is unset —
+  // a button linking nowhere is worse than no button.
+  const loginUrl = env.FRONTEND_URL
+    ? `${env.FRONTEND_URL.replace(/\/$/, '')}/login`
+    : undefined;
+
+  // Offered unconditionally, without trying to establish WHY the charge failed.
+  // Paystack does not reliably report a reason — a live fraud decline came back
+  // with description: null on both the webhook and the API — so any branching on
+  // cause would be branching on a value we usually do not have.
+  //
+  // Instead the copy covers both remedies and lets the member pick: top up (for
+  // insufficient funds, where Paystack's own retry resolves it and replacing the
+  // card would be pointless work) or replace the card (expired/declined, where a
+  // retry on the same card fails forever). Presented as an option rather than an
+  // instruction, so neither reader is misdirected.
+  //
+  // Points at our own redirect rather than a Paystack link minted here. Paystack's
+  // token expires in ~24h while the grace period runs for GRACE_PERIOD_DAYS, so an
+  // embedded link would be dead for anyone opening this a day later — and minting
+  // it here also put an outbound call inside the webhook request path. The
+  // redirect mints one at click time instead.
+  const subscription = await prisma.subscription.findFirst({
+    where: { userId, planId, status: { in: ['ACTIVE', 'GRACE'] } },
+    orderBy: { createdAt: 'desc' },
+  });
+  // Both halves required: the token is what authorises the redirect, and it is
+  // nullable on subscriptions created before that path existed.
+  const manageCardUrl =
+    env.API_BASE_URL && subscription?.paystackSubscriptionCode && subscription.paystackEmailToken
+      ? `${env.API_BASE_URL.replace(/\/$/, '')}/paystack/manage/` +
+        `${subscription.paystackSubscriptionCode}/${subscription.paystackEmailToken}`
+      : null;
+
   const text =
     `${greeting}\n\n` +
     `Your ${plan?.name} subscription has expired. You have a ${GRACE_PERIOD_DAYS}-day grace ` +
     `period to renew before access is removed.\n\n` +
-    `Renew to keep your access.`;
+    (manageCardUrl
+      ? `Two ways to sort this out:\n` +
+        `• If there simply weren't funds available, top up — we retry automatically, nothing else needed.\n` +
+        `• If the card has expired or was declined, replace it here (this also fixes future renewals): ${manageCardUrl}\n\n`
+      : '') +
+    (loginUrl ? `Renew to keep your access: ${loginUrl}\n\n` : `Renew to keep your access via your dashboard.\n\n`) +
+    `Glad you're here,\nThe ZCN Team`;
 
   const html =
     `<p>${greeting}</p>` +
     `<p>Your <strong>${plan?.name}</strong> subscription has expired. You have a ` +
     `<strong>${GRACE_PERIOD_DAYS}-day grace period</strong> to renew before access is removed.</p>` +
-    `<p>Renew to keep your access.</p>`;
+    (manageCardUrl
+      ? `<p>Two ways to sort this out:</p>` +
+        `<ul><li>If there simply weren't funds available, top up — we retry automatically, nothing else needed.</li>` +
+        `<li>If the card has expired or was declined, replace it below. This also fixes future renewals.</li></ul>` +
+        `<p><a href="${escapeHtml(manageCardUrl)}" style="display:inline-block;padding:12px 20px;` +
+        `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Update your card</a></p>`
+      : '') +
+    (loginUrl
+      ? `<p><a href="${escapeHtml(loginUrl)}" style="display:inline-block;padding:12px 20px;` +
+        `background:#111;color:#fff;text-decoration:none;border-radius:6px;">Renew your subscription</a></p>`
+      : `<p>Renew to keep your access via your dashboard.</p>`) +
+    `<p>Glad you're here,<br>The ZCN Team</p>`;
 
   await sendMail({ to: user.email, subject, html, text });
 };
@@ -552,16 +656,25 @@ export const sendExpiryEmail = async (userId: string, planId: string): Promise<v
   const greeting = user.name ? `Hi ${user.name},` : 'Hi,';
   const subject = `Your ${plan?.name} access has ended`;
 
+  const loginUrl = env.FRONTEND_URL
+    ? `${env.FRONTEND_URL.replace(/\/$/, '')}/login`
+    : undefined;
+
   const text =
     `${greeting}\n\n` +
     `Your ${plan?.name} subscription and grace period have ended, so your access has been removed.\n\n` +
-    `You can resubscribe at any time.`;
+    (loginUrl ? `You can resubscribe at any time: ${loginUrl}\n\n` : `You can resubscribe at any time.\n\n`) +
+    `Glad you're here,\nThe ZCN Team`;
 
   const html =
     `<p>${greeting}</p>` +
     `<p>Your <strong>${plan?.name}</strong> subscription and grace period have ended, ` +
     `so your access has been removed.</p>` +
-    `<p>You can resubscribe at any time.</p>`;
+    (loginUrl
+      ? `<p><a href="${escapeHtml(loginUrl)}" style="display:inline-block;padding:12px 20px;` +
+        `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Resubscribe</a></p>`
+      : `<p>You can resubscribe at any time.</p>`) +
+    `<p>Glad you're here,<br>The ZCN Team</p>`;
 
   await sendMail({ to: user.email, subject, html, text });
 };
@@ -597,4 +710,120 @@ export const sendRenewalEmail = async (userId: string, planId: string): Promise<
     `<p>Thank you for staying with us.</p>`;
 
   await sendMail({ to: user.email, subject, html, text });
+};
+
+// Monthly check-in for the tiers that include the 90-Day Execution Track &
+// Goal-Bursting Worksheet. Sent by the scheduled worksheet-reminder job.
+//
+
+export const sendWorksheetReminderEmail = async (
+  userId: string,
+  planId: string,
+): Promise<boolean> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user?.email) {
+    logger.error('Cannot send worksheet reminder — user has no email', { userId });
+    return false;
+  }
+
+  const plan = await resolvePlan(planId);
+  const greeting = user.name ? `Hi ${user.name},` : 'Hi,';
+  const subject = 'Your 90-day Worksheet — how is it going?';
+
+  // The member may have lost the activation email months ago, so the monthly
+  // check-in carries the worksheet itself rather than only asking about it.
+  const docs = documentBenefits(plan?.benefits ?? []);
+
+
+  const text =
+    `${greeting}\n\n` +
+    `Your ${plan?.name} membership includes the 90-Day Execution Track & Goal-Bursting ` +
+    `Worksheet — your annual goals broken into enforced 90-day sprints, with a working ` +
+    `document that turns each sprint into a real, trackable plan.\n\n` +
+    `Two questions, and they only take a minute to answer honestly:\n` +
+    `1. Have you filled yours in yet?\n` +
+    `2. If you have — are you actually hitting the goals you set for each interval?\n\n` +
+    documentsToText(docs);
+
+  const html =
+    `<p>${greeting}</p>` +
+    `<p>Your <strong>${escapeHtml(plan?.name)}</strong> membership includes the ` +
+    `<strong>90-Day Execution Track &amp; Goal-Bursting Worksheet</strong> — your annual goals ` +
+    `broken into enforced 90-day sprints, with a working document that turns each sprint into a ` +
+    `real, trackable plan.</p>` +
+    `<p>Two questions, and they only take a minute to answer honestly:</p>` +
+    `<ol><li>Have you filled yours in yet?</li>` +
+    `<li>If you have — are you actually hitting the goals you set for each interval?</li></ol>` +
+    documentsToHtml(docs);
+
+  return sendMail({ to: user.email, subject, html, text });
+};
+
+export interface ExpiredSubscriberSummary {
+  memberId: string | null;
+  name: string | null;
+  email: string | null;
+  phoneNumber: string;
+  planName: string;
+  expiryDate: Date;
+}
+
+// One digest per sweep rather than one email per member: a single run can expire
+// up to its batch size, and forty separate emails would be unreadable and would
+// train the operators to ignore them.
+//
+// Sent to the operators, so member contact details are included deliberately —
+// they are exactly what is needed to action the removals below. Never throws:
+// this is a notification about work already committed, and a failed send must
+// not roll back an expiry the member's access already reflects.
+export const sendExpiryDigestToAdmins = async (
+  expired: ExpiredSubscriberSummary[],
+): Promise<void> => {
+  if (expired.length === 0) return;
+
+  try {
+    const admins = await activeAdminEmails();
+    if (admins.length === 0) {
+      logger.warn('Subscriptions expired but no admin recipients are configured', {
+        count: expired.length,
+      });
+      return;
+    }
+
+    const subject = `${expired.length} subscription${expired.length === 1 ? '' : 's'} expired`;
+    const row = (s: ExpiredSubscriberSummary) =>
+      [s.memberId ?? '—', s.name ?? '—', s.email ?? s.phoneNumber, s.planName, s.expiryDate.toLocaleDateString()];
+
+    const text =
+      `${expired.length} subscription${expired.length === 1 ? '' : 's'} moved from grace to expired.\n\n` +
+      expired.map((s) => `• ${row(s).join('  |  ')}`).join('\n') +
+      `\n\nEach of these now needs removing from the WhatsApp groups their plan granted — ` +
+      `WhatsApp's API cannot do this for us. They are queued at GET /api/admin/removals.`;
+
+    const html =
+      `<p><strong>${expired.length} subscription${expired.length === 1 ? '' : 's'}</strong> ` +
+      `moved from grace to expired.</p>` +
+      `<table cellpadding="6" style="border-collapse:collapse;font-size:14px;">` +
+      `<tr style="background:#f4f4f4;text-align:left;">` +
+      ['Member ID', 'Name', 'Contact', 'Plan', 'Expired'].map((h) => `<th>${h}</th>`).join('') +
+      `</tr>` +
+      expired
+        .map(
+          (s) =>
+            `<tr style="border-top:1px solid #ddd;">` +
+            row(s).map((c) => `<td>${escapeHtml(c)}</td>`).join('') +
+            `</tr>`,
+        )
+        .join('') +
+      `</table>` +
+      `<p>Each of these now needs removing from the WhatsApp groups their plan granted — ` +
+      `WhatsApp's API cannot do this for us. They are queued at ` +
+      `<code>GET /api/admin/removals</code>.</p>`;
+
+    await Promise.all(
+      admins.map((email) => sendMail({ to: email, subject: `[ZuriBot] ${subject}`, html, text })),
+    );
+  } catch (error: any) {
+    logger.error('Failed to send expiry digest to admins', { error: error.message });
+  }
 };

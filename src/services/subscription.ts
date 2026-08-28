@@ -3,7 +3,13 @@ import { env } from '../config/env';
 import { GRACE_PERIOD_DAYS } from '../config/constants';
 import { resolvePlan } from './plan';
 import { sendTextMessage, sendCtaUrlMessage } from './whatsapp';
-import { sendGracePeriodEmail, sendExpiryEmail, sendExtensionEmail } from './email';
+import {
+  sendGracePeriodEmail,
+  sendExpiryEmail,
+  sendExtensionEmail,
+  sendExpiryDigestToAdmins,
+  ExpiredSubscriberSummary,
+} from './email';
 import { logger } from '../utils/logger';
 import { SubscriptionStats } from '../types';
 
@@ -59,7 +65,16 @@ export const moveToGracePeriod = async (subscriptionId: string): Promise<void> =
     userId: subscription.userId,
   });
 
-  await sendGracePeriodNotification(subscription.user.phoneNumber, subscription.planId);
+  // Email, not WhatsApp. This ran unconditionally against WhatsApp before —
+  // ignoring both ENABLE_WHATSAPP_NOTIFICATIONS and the subscription's channel —
+  // so a member moved to grace by the invoice.payment_failed webhook got a failed
+  // send and no notification at all. Best-effort: a member's access has already
+  // changed and a bounced email must not roll that back or abort the caller.
+  try {
+    await sendGracePeriodEmail(subscription.userId, subscription.planId);
+  } catch (error: any) {
+    logger.error('Grace period email failed', { subscriptionId, error: error.message });
+  }
 };
 
 export const expireSubscription = async (subscriptionId: string): Promise<void> => {
@@ -74,7 +89,12 @@ export const expireSubscription = async (subscriptionId: string): Promise<void> 
     userId: subscription.userId,
   });
 
-  await sendExpiryNotification(subscription.user.phoneNumber, subscription.planId);
+  // See moveToGracePeriod — same fix, same reasoning.
+  try {
+    await sendExpiryEmail(subscription.userId, subscription.planId);
+  } catch (error: any) {
+    logger.error('Expiry email failed', { subscriptionId, error: error.message });
+  }
 };
 
 export const getExpiredSubscriptions = async (take?: number) => {
@@ -116,14 +136,28 @@ export interface ExpirySweepResult {
   notifyFailures: number;
 }
 
-// Advances subscriptions whose time has run out: ACTIVE→GRACE at expiry, and
-// GRACE→EXPIRED once the grace window closes.
+// Advances subscriptions whose time has run out.
+//
+// GRACE→EXPIRED always runs. ACTIVE→GRACE is opt-in via includeGraceTransition
+// and is currently OFF for the scheduled sweep — see cron.routes.ts.
 //
 // Safe to run repeatedly and concurrently (cron + admin trigger at once): each
 // row is advanced with a conditional updateMany, so only the caller that
 // actually flips the status sends the notification. Batched so a backlog can't
 // exceed the serverless function limit — re-run until counts come back zero.
-export const runExpirySweep = async (batchSize = 100): Promise<ExpirySweepResult> => {
+export interface ExpirySweepOptions {
+  batchSize?: number;
+  /**
+   * Whether to also advance ACTIVE subscriptions past their expiry into GRACE.
+   * Off by default: the scheduled sweep currently runs the GRACE→EXPIRED step
+   * only, with entry into GRACE driven by the invoice.payment_failed webhook.
+   */
+  includeGraceTransition?: boolean;
+}
+
+export const runExpirySweep = async (
+  { batchSize = 100, includeGraceTransition = false }: ExpirySweepOptions = {},
+): Promise<ExpirySweepResult> => {
   const result: ExpirySweepResult = { movedToGrace: 0, expired: 0, skipped: 0, notifyFailures: 0 };
 
   // Notifications are best-effort: a failed WhatsApp/SMTP call must not abort the
@@ -137,7 +171,7 @@ export const runExpirySweep = async (batchSize = 100): Promise<ExpirySweepResult
     }
   };
 
-  for (const sub of await getExpiredSubscriptions(batchSize)) {
+  for (const sub of includeGraceTransition ? await getExpiredSubscriptions(batchSize) : []) {
     const claim = await prisma.subscription.updateMany({
       where: { id: sub.id, status: 'ACTIVE' },
       data: {
@@ -166,6 +200,10 @@ export const runExpirySweep = async (batchSize = 100): Promise<ExpirySweepResult
     );
   }
 
+  // Collected across the batch so the operators get one digest rather than an
+  // email per member — see sendExpiryDigestToAdmins.
+  const expiredForAdmins: ExpiredSubscriberSummary[] = [];
+
   for (const sub of await getGracePeriodExpired(batchSize)) {
     const claim = await prisma.subscription.updateMany({
       where: { id: sub.id, status: 'GRACE' },
@@ -187,7 +225,21 @@ export const runExpirySweep = async (batchSize = 100): Promise<ExpirySweepResult
           : sendExpiryEmail(sub.userId, sub.planId),
       { subscriptionId: sub.id, stage: 'expired' },
     );
+
+    expiredForAdmins.push({
+      memberId: sub.user.memberId,
+      name: sub.user.name,
+      email: sub.user.email,
+      phoneNumber: sub.user.phoneNumber,
+      planName: (await resolvePlan(sub.planId))?.name ?? sub.planId,
+      expiryDate: sub.expiryDate,
+    });
   }
+
+  // After the loop, so one run produces one email. Only rows this run actually
+  // flipped are included — a subscription another caller claimed first was
+  // skipped above and is somebody else's digest.
+  await sendExpiryDigestToAdmins(expiredForAdmins);
 
   logger.info('Expiry sweep complete', { ...result });
   return result;

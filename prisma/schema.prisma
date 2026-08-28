@@ -84,6 +84,10 @@ model Subscription {
   // Stable across card changes — the durable fallback when the authorization
   // code has rotated. See tryRecurringRenewalFromCharge.
   paystackCustomerCode      String?            @map("paystack_customer_code")
+  // Last worksheet check-in sent by the monthly reminder job. Tracked per
+  // subscription rather than per job run so a manual trigger, or a re-run after
+  // a partial failure, cannot email the same member twice in a month.
+  worksheetReminderSentAt   DateTime?          @map("worksheet_reminder_sent_at")
   createdAt                 DateTime           @default(now()) @map("created_at")
   updatedAt                 DateTime           @updatedAt @map("updated_at")
 
@@ -239,6 +243,22 @@ model Payment {
   @@map("payments")
 }
 
+// Last successful run of a scheduled job, so a job that stops running can be
+// detected. One row per job name; the sweep is currently the only entry.
+//
+// Needed because the sweep is the single path that revokes access — a member
+// past expiry stays ACTIVE indefinitely if it silently stops, and nothing else
+// in the system would notice.
+model JobRun {
+  name          String   @id
+  lastSuccessAt DateTime @map("last_success_at")
+  // Counts from the last run, for eyeballing whether it is doing any work.
+  lastResult    Json?    @map("last_result")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("job_runs")
+}
+
 model WebhookLog {
   // Stable fingerprint of an inbound event, used to reject replays. Paystack
   // sends no event ID, so it is derived from the payload — see eventKey().
@@ -303,6 +323,10 @@ enum BillingInterval {
   // expiry cycle in minutes instead of waiting a month.
   HOURLY
   DAILY
+  // Paystack's shortest interval that still emits invoice.create /
+  // invoice.update, so it is the only way to exercise the recurring-invoice path
+  // without waiting a month.
+  WEEKLY
   MONTHLY
   SEMIANNUAL
   ANNUAL
@@ -311,6 +335,9 @@ enum BillingInterval {
 enum BenefitType {
   WHATSAPP_GROUP
   EVENT_ACCESS
+  // A file the plan entitles the member to. inviteLink holds its URL — hosted
+  // rather than bundled with the app, so it can be revised without a redeploy.
+  DOCUMENT
 }
 
 // How a subscription/payment was originated. Drives post-payment delivery:

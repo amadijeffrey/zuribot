@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { env } from '../config/env';
 import { prisma } from '../config/database';
-import { processWebhookEvent, verifyPayment } from '../services/payment';
+import { processWebhookEvent, verifyPayment, getSubscriptionManageLink } from '../services/payment';
 import { logger } from '../utils/logger';
 
 // Paystack sends no event ID, so a replay is only detectable by fingerprinting
@@ -142,4 +142,52 @@ const verifySignature = (req: Request, signature: string): boolean => {
     .digest('hex');
 
   return hash === signature;
+};
+// GET /paystack/manage/:subscriptionCode/:emailToken
+//
+// Redirects a member to Paystack's hosted page for replacing the card bound to
+// their subscription. Linked from the grace-period email.
+//
+// Unauthenticated on purpose. Paystack's manage link carries a token that
+// expires in ~24 hours, but the grace period runs for GRACE_PERIOD_DAYS — so
+// embedding a link directly in the email means anyone opening it a day later
+// gets a dead page, precisely while we still want them to fix their billing.
+// Minting at click time removes that.
+//
+// `emailToken` is the per-subscription secret Paystack itself uses to authorize
+// that page — it is what Paystack puts in its own customer emails — so requiring
+// it here is the same trust model, not a weaker one. Matching it against the
+// stored value means the URL cannot be walked by guessing subscription codes.
+//
+// Deliberately not behind a session: this is an email CTA aimed at someone whose
+// billing is already failing, and a login wall between them and the fix costs
+// exactly the conversions we are trying to save.
+export const handleManageSubscription = async (req: Request, res: Response): Promise<void> => {
+  const { subscriptionCode, emailToken } = req.params;
+
+  const subscription = await prisma.subscription.findUnique({
+    where: { paystackSubscriptionCode: subscriptionCode },
+    select: { id: true, paystackEmailToken: true },
+  });
+
+  // Same response for unknown subscription and wrong token, so this cannot be
+  // used to discover which subscription codes exist.
+  if (!subscription || !subscription.paystackEmailToken || subscription.paystackEmailToken !== emailToken) {
+    logger.warn('Invalid manage-subscription link', { subscriptionCode });
+    res.status(404).json({ error: 'This link is no longer valid. Please log in to manage your subscription.' });
+    return;
+  }
+
+  const link = await getSubscriptionManageLink(subscriptionCode);
+
+  if (!link) {
+    logger.error('Could not mint manage link for a valid subscription', {
+      subscriptionId: subscription.id,
+      subscriptionCode,
+    });
+    res.status(502).json({ error: 'Could not reach the payment provider. Please try again shortly.' });
+    return;
+  }
+
+  res.redirect(302, link);
 };
