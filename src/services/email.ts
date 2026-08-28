@@ -2,7 +2,7 @@ import axios from 'axios';
 import { prisma } from '../config/database';
 import { env } from '../config/env';
 import { GRACE_PERIOD_DAYS } from '../config/constants';
-import { resolvePlan, getFreeGroupBenefit } from './plan';
+import { resolvePlan, getFreeGroupBenefit, priceForSubscription } from './plan';
 import { logger } from '../utils/logger';
 
 // Resend's HTTP API. Plain HTTPS keeps this working on serverless hosts that
@@ -222,6 +222,22 @@ const documentsToHtml = (docs: DocumentBenefit[]): string =>
         .join('')
     : '';
 
+// Perks are the benefits that are neither a joinable group nor a downloadable
+// document — today that is the Apex VIP event.
+//
+// They are a commitment reward: only the 6-month and annual intervals include
+// them. A monthly subscriber gets everything else the plan grants, but not
+// these, so the email must not promise one.
+const PERK_INTERVALS = new Set(['SEMIANNUAL', 'ANNUAL']);
+
+const perksFor = (
+  benefits: { type: string; name: string }[],
+  interval: string | undefined,
+): { name: string }[] =>
+  interval && PERK_INTERVALS.has(interval)
+    ? benefits.filter((b) => b.type !== 'WHATSAPP_GROUP' && b.type !== 'DOCUMENT')
+    : [];
+
 export const sendActivationEmail = async (userId: string, planId: string): Promise<void> => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user?.email) {
@@ -237,13 +253,14 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
   const expiryDate = subscription?.expiryDate.toLocaleDateString() || 'N/A';
 
   const groups = plan?.groupLinks ?? [];
-  // Perks that aren't a joinable link (the Apex VIP event) — mentioned, not linked.
   // Documents are delivered as their own buttons below, so they must not also
   // appear in the "Also included" name list.
   const docs = documentBenefits(plan?.benefits ?? []);
-  const perks = (plan?.benefits ?? []).filter(
-    (b) => b.type !== 'WHATSAPP_GROUP' && b.type !== 'DOCUMENT',
-  );
+  // Gated on the interval actually purchased — see perksFor.
+  const price = subscription
+    ? await priceForSubscription(planId, subscription.planPriceId)
+    : undefined;
+  const perks = perksFor(plan?.benefits ?? [], price?.interval);
 
   if (groups.length === 0) {
     // Paid, but we have nothing to deliver — the plan's invite links are unset.
@@ -329,9 +346,18 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
     }
   }
   const docs = documentBenefits(plans.flatMap((p) => p.benefits));
-  const perks = plans.flatMap((p) =>
-    p.benefits.filter((b) => b.type !== 'WHATSAPP_GROUP' && b.type !== 'DOCUMENT'),
-  );
+  // Resolved per SUBSCRIPTION rather than from `plans`, because perks depend on
+  // the interval that subscription was bought at — and `plans` is filtered, so
+  // its indexes no longer line up with `subscriptions`.
+  const perks = (
+    await Promise.all(
+      subscriptions.map(async (sub) => {
+        const p = await resolvePlan(sub.planId);
+        const pr = await priceForSubscription(sub.planId, sub.planPriceId);
+        return perksFor(p?.benefits ?? [], pr?.interval);
+      }),
+    )
+  ).flat();
 
   if (groups.length === 0) {
     // Everyone gets at least the free group — this means it's unconfigured.
