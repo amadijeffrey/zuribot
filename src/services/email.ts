@@ -323,6 +323,17 @@ export const sendActivationEmail = async (userId: string, planId: string): Promi
 // profile completion succeeds the member's paid subscription(s), if any, are
 // active — so this always includes the free group plus every plan they
 // currently hold.
+// Shown in place of the per-plan copy when a member finishes registration
+// without buying anything. planCopies is empty for them, so the email would
+// otherwise jump straight from "your access is ready" to the free group with
+// nothing said about the paid tiers.
+const NO_PLAN_COPY =
+  "Here's what you're not seeing yet: right now, inside ZCN Premium, a founder just posted her " +
+  'real overhead numbers in SME Circle and got three honest answers back in under an hour. ' +
+  'Someone in Accelerator sent a warm investor introduction to a woman she met inside the network ' +
+  "four months ago. That's not a sales pitch, that's just what happens one tier over. You'll see " +
+  'the door when you\'re ready for it.';
+
 export const sendMembershipActivationEmail = async (userId: string): Promise<void> => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user?.email) {
@@ -388,7 +399,7 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
           .map((l) => `Your ${l.name} subscription is now active. It expires on ${l.expiry}.`)
           .join('\n') + '\n\n'
       : '') +
-    planCopies.map(planCopyToText).join('') +
+    (planCopies.length ? planCopies.map(planCopyToText).join('') : `${NO_PLAN_COPY}\n\n`) +
     (groups.length
       ? `Join your ${groups.length} exclusive ${groupWord}:\n` +
         groups.map((g, i) => `${i + 1}. ${g.name}: ${g.inviteLink}`).join('\n') +
@@ -407,7 +418,9 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
           `It expires on <strong>${escapeHtml(l.expiry)}</strong>.</p>`,
       )
       .join('') +
-    planCopies.map(planCopyToHtml).join('') +
+    (planCopies.length
+      ? planCopies.map(planCopyToHtml).join('')
+      : `<p>${escapeHtml(NO_PLAN_COPY)}</p>`) +
     (groups.length
       ? `<p>Join your ${groups.length} exclusive ${groupWord}:</p>` +
         groups
