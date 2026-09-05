@@ -56,6 +56,7 @@ if (isLocal) {
 }
 
 // Payments
+// Filters via query string — ?status, ?hours, ?order, ?page, ?limit.
 router.get('/payments', asyncHandler(adminHandler.getPayments));
 
 // Plans

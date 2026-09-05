@@ -27,3 +27,13 @@ export const PAYMENT_STATUS = {
 } as const;
 
 export const GRACE_PERIOD_DAYS = env.GRACE_PERIOD_DAYS;
+// How long a payment may sit PENDING before it is worth a human's attention.
+//
+// Below this, the member is most likely still on the Paystack page — the charge
+// simply has not completed yet. Above it, a webhook should have arrived, so the
+// payment either failed or its event was lost, which is the case reconciliation
+// exists to rescue.
+//
+// Shared so the admin list and runReconciliation cannot drift: the list must not
+// flag rows that reconciliation would ignore, or ignore rows it would act on.
+export const PENDING_STALE_AFTER_MINUTES = 10;

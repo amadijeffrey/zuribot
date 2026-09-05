@@ -13,6 +13,7 @@ import { getPendingRemovals, markAccessRevoked } from '../services/removal';
 import { sendCustomEmail, resendGroupLinksEmail } from '../services/email';
 import { getAllPlans, resolvePlan } from '../services/plan';
 import { SAFE_USER_SELECT } from '../services/user';
+import { PENDING_STALE_AFTER_MINUTES } from '../config/constants';
 import { normalizeMemberId } from '../utils/member-id';
 import { logger } from '../utils/logger';
 
@@ -360,28 +361,66 @@ export const broadcast = async (req: Request, res: Response): Promise<void> => {
   res.json({ success: true, sent, failed, total: uniqueUsers.length });
 };
 
+// GET /admin/payments — the payments list.
+//
+//   ?status=PENDING   filter by status
+//   ?hours=24         only payments created in the last N hours (max 168)
+//   ?order=asc        oldest first; default is newest first
+//   ?page / ?limit    paging, default 20 per page
+//
+// "What is stuck right now" is ?status=PENDING&hours=24&order=asc — a payment
+// under ~10 minutes old is someone still on the Paystack page, whereas hours
+// old means it failed or its webhook never arrived. Oldest-first puts those at
+// the top instead of burying them under checkouts started seconds ago, which is
+// why the order is worth flipping for that view.
 export const getPayments = async (req: Request, res: Response): Promise<void> => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = parseInt(req.query.limit as string) || 20;
   const status = req.query.status as string;
+  const order = req.query.order === 'asc' ? 'asc' : 'desc';
+  const hours = req.query.hours
+    ? Math.min(Math.max(parseInt(req.query.hours as string) || 24, 1), 168)
+    : undefined;
   const skip = (page - 1) * limit;
 
   const where: any = {};
   if (status) where.status = status;
+  if (hours) where.createdAt = { gte: new Date(Date.now() - hours * 60 * 60 * 1000) };
 
-  const [payments, total] = await Promise.all([
+  const [payments, total, sum] = await Promise.all([
     prisma.payment.findMany({
       where,
       skip,
       take: limit,
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: order },
       include: { user: { select: SAFE_USER_SELECT } },
     }),
     prisma.payment.count({ where }),
+    // Across the whole filtered set, not just this page — the useful figure is
+    // "how much is sitting in this state", which a page total cannot answer.
+    prisma.payment.aggregate({ where, _sum: { amount: true } }),
   ]);
 
+  // Resolved once and looked up per row. Mapping resolvePlan over the rows
+  // inside a Promise.all fires every lookup concurrently, so on a cold cache
+  // they all miss together and each triggers its own full plan load.
+  const planNames = new Map((await getAllPlans()).map((pl) => [pl.code, pl.name]));
+  const now = Date.now();
+
   res.json({
-    data: payments,
+    data: payments.map((p) => ({
+      ...p,
+      planName: planNames.get(p.planId) ?? p.planId,
+      // The number that decides what to do about a PENDING row, plus the
+      // verdict, so nobody has to remember where the line sits.
+      ageMinutes: Math.round((now - p.createdAt.getTime()) / 60_000),
+      // Only meaningful for PENDING: a settled payment is never "stale".
+      stale:
+        p.status === 'PENDING' &&
+        now - p.createdAt.getTime() > PENDING_STALE_AFTER_MINUTES * 60 * 1000,
+    })),
+    totalAmount: sum._sum.amount ?? 0,
+    ...(hours ? { windowHours: hours } : {}),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) },
   });
 };

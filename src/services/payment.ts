@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type { Subscription, BillingInterval } from '@prisma/client';
 import { prisma } from '../config/database';
 import { env } from '../config/env';
-import { GRACE_PERIOD_DAYS, PLAN_CURRENCY } from '../config/constants';
+import { PENDING_STALE_AFTER_MINUTES, GRACE_PERIOD_DAYS, PLAN_CURRENCY } from '../config/constants';
 import {
   resolvePlan,
   findByPaystackPlanCode,
@@ -1844,7 +1844,7 @@ export const runReconciliation = async (opts?: {
   batchSize?: number;
   includeSubscriptions?: boolean;
 }): Promise<ReconciliationResult> => {
-  const pendingOlderThanMinutes = opts?.pendingOlderThanMinutes ?? 10;
+  const pendingOlderThanMinutes = opts?.pendingOlderThanMinutes ?? PENDING_STALE_AFTER_MINUTES;
   const maxAgeDays = opts?.maxAgeDays ?? 7;
   const batchSize = opts?.batchSize ?? 50;
 
