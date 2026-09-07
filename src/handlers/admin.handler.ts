@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { SubscriptionStatus } from '@prisma/client';
 import { prisma } from '../config/database';
 import {
   getActiveSubscription,
@@ -21,6 +22,9 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = parseInt(req.query.limit as string) || 20;
   const memberId = req.query.memberId as string | undefined;
+  const search = (req.query.search as string | undefined)?.trim();
+  const status = req.query.status as string | undefined;
+  const planId = req.query.planId as string | undefined;
   const skip = (page - 1) * limit;
 
   // member_id is unique, so this narrows to at most one row — but it still goes
@@ -28,6 +32,34 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
   // reuse one list renderer whether or not the filter is applied.
   const where: any = {};
   if (memberId) where.memberId = normalizeMemberId(memberId);
+
+  if (search) {
+    where.OR = [
+      { name: { contains: search, mode: 'insensitive' } },
+      { email: { contains: search, mode: 'insensitive' } },
+      { phoneNumber: { contains: search, mode: 'insensitive' } },
+    ];
+  }
+
+  // NONE means "never subscribed" — a plain relation filter, no status/plan to
+  // combine it with. ACTIVE/GRACE/EXPIRED/CANCELLED instead narrow to users
+  // with a matching subscription, and when a plan is also picked both land on
+  // the SAME `some` so "GRACE + Wealth" can't match a user whose Wealth plan
+  // is active but whose separate Health plan happens to be in grace.
+  if (status === 'NONE') {
+    where.subscriptions = { none: {} };
+  } else if (status || planId) {
+    const validStatus =
+      status && (Object.values(SubscriptionStatus) as string[]).includes(status)
+        ? (status as SubscriptionStatus)
+        : undefined;
+    where.subscriptions = {
+      some: {
+        ...(validStatus ? { status: validStatus } : {}),
+        ...(planId ? { planId } : {}),
+      },
+    };
+  }
 
   const [users, total] = await Promise.all([
     prisma.user.findMany({
