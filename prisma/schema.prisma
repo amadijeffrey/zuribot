@@ -26,6 +26,13 @@ model User {
   // therefore cannot log in until they register.
   passwordHash String? @map("password_hash")
 
+  // Forgot-password flow. Holds a hash of the raw token emailed to the member
+  // (never the raw token itself) plus its expiry — one slot per user, so
+  // requesting a new reset link naturally invalidates any earlier unused one.
+  // Both cleared once the reset succeeds (single-use).
+  passwordResetTokenHash String?   @map("password_reset_token_hash")
+  passwordResetExpiresAt DateTime? @map("password_reset_expires_at")
+
   dateOfBirth  DateTime? @map("date_of_birth") @db.Date
   occupation   String?
   businessName String?   @map("business_name")

@@ -116,3 +116,38 @@ export const adminRateLimiter = limiter({
   max: 200,
   message: { error: 'Admin rate limit exceeded' },
 });
+
+// /forgot-password always responds 200 (enumeration-safe), so
+// skipSuccessfulRequests would neuter this entirely — every request "succeeds"
+// from an HTTP-status standpoint. Counts every attempt instead.
+export const forgotPasswordIpRateLimiter = limiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many password reset requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Companion to the IP limiter above, keyed by the target email instead — an
+// IP-only limit lets an attacker spread requests across many IPs to spam one
+// victim's inbox. Falls back to req.ip if the body isn't shaped as expected;
+// the route's own zod validation is what actually rejects a bad body.
+export const forgotPasswordEmailRateLimiter = limiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req: any) =>
+    typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : req.ip,
+  message: { error: 'Too many password reset requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// /reset-password: a 32-byte token is computationally infeasible to guess, so
+// this is a floor rather than the primary protection.
+export const resetPasswordRateLimiter = limiter({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many attempts, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});

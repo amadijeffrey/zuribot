@@ -25,6 +25,8 @@ import {
   verifyCredentials,
   issueToken,
   changePassword,
+  createPasswordResetToken,
+  resetPasswordWithToken,
   MIN_PASSWORD_LENGTH,
 } from '../services/user-auth';
 import { env } from '../config/env';
@@ -286,6 +288,52 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   }
 
   res.json({ token: issueToken(user), expiresIn: env.JWT_EXPIRES_IN, user });
+};
+
+const forgotPasswordSchema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+});
+
+// POST /users/forgot-password — always 200 regardless of whether the email
+// matches an account: the response must never signal that, or it becomes an
+// enumeration oracle. See createPasswordResetToken for the actual gating.
+export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
+  const parsed = forgotPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'A valid email is required' });
+    return;
+  }
+
+  await createPasswordResetToken(parsed.data.email);
+
+  res.json({
+    success: true,
+    message: 'If an account exists for that email, a reset link has been sent.',
+  });
+};
+
+const resetPasswordSchema = z.object({
+  token: z.string().min(1),
+  newPassword: z
+    .string()
+    .min(MIN_PASSWORD_LENGTH, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`),
+});
+
+// POST /users/reset-password — completes the flow started by /forgot-password.
+export const resetPasswordHandler = async (req: Request, res: Response): Promise<void> => {
+  const parsed = resetPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors });
+    return;
+  }
+
+  const ok = await resetPasswordWithToken(parsed.data.token, parsed.data.newPassword);
+  if (!ok) {
+    res.status(400).json({ error: 'Reset link is invalid or has expired' });
+    return;
+  }
+
+  res.json({ success: true, message: 'Password reset' });
 };
 
 // GET /users/me — profile plus current subscriptions. Auth required.

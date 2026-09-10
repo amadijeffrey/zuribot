@@ -3,6 +3,8 @@ import {
   listPlans,
   register,
   login,
+  forgotPassword,
+  resetPasswordHandler,
   me,
   updateProfile,
   subscribe,
@@ -20,6 +22,9 @@ import {
   registerRateLimiter,
   memberActionRateLimiter,
   memberReadRateLimiter,
+  forgotPasswordIpRateLimiter,
+  forgotPasswordEmailRateLimiter,
+  resetPasswordRateLimiter,
 } from '../middleware/rate-limit';
 
 const router = Router();
@@ -31,6 +36,14 @@ const router = Router();
 router.post('/register', registerRateLimiter, asyncHandler(register));
 // Separate bucket from the admin login limiter — see memberLoginRateLimiter.
 router.post('/login', memberLoginRateLimiter, asyncHandler(login));
+// Two limiters (IP + target email) — see their definitions in rate-limit.ts.
+router.post(
+  '/forgot-password',
+  forgotPasswordIpRateLimiter,
+  forgotPasswordEmailRateLimiter,
+  asyncHandler(forgotPassword),
+);
+router.post('/reset-password', resetPasswordRateLimiter, asyncHandler(resetPasswordHandler));
 // Called by the frontend success page with the reference from the Paystack
 // redirect, so it cannot require a session.
 router.get('/payment-status', apiRateLimiter, asyncHandler(paymentStatus));

@@ -507,6 +507,42 @@ export const sendWelcomeEmail = async (userId: string): Promise<boolean> => {
   return sendMail({ to: user.email, subject: 'Welcome to ZuriCircle Network', html, text });
 };
 
+// Forgot-password flow. `rawToken` is the only place this ever leaves the
+// process other than the isLocal-gated debug log in user-auth.ts — the DB
+// only ever holds a hash of it.
+export const sendPasswordResetEmail = async (userId: string, rawToken: string): Promise<boolean> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user?.email) {
+    logger.error('Cannot send password reset email — user has no email', { userId });
+    return false;
+  }
+
+  const greeting = user.name ? `Hi ${user.name},` : 'Hi,';
+
+  if (!env.FRONTEND_URL) {
+    logger.error('Password reset email — FRONTEND_URL not configured, cannot build reset link', { userId });
+    return false;
+  }
+  const resetUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/reset-password?token=${rawToken}`;
+
+  const text =
+    `${greeting}\n\nWe received a request to reset your Zuri Circle Network password.\n\n` +
+    `Reset your password: ${resetUrl}\n\n` +
+    `This link expires in 5 minutes and only works once — if you request another one, this link stops working.\n\n` +
+    `If you didn't request this, you can safely ignore this email; your password won't change.\n\n` +
+    `The ZCN Team`;
+
+  const html =
+    `<p>${greeting}</p><p>We received a request to reset your Zuri Circle Network password.</p>` +
+    `<p><a href="${escapeHtml(resetUrl)}" style="display:inline-block;padding:12px 20px;` +
+    `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Reset your password</a></p>` +
+    `<p>This link expires in 5 minutes and only works once — if you request another one, this link stops working.</p>` +
+    `<p>If you didn't request this, you can safely ignore this email; your password won't change.</p>` +
+    `<p>The ZCN Team</p>`;
+
+  return sendMail({ to: user.email, subject: 'Reset your Zuri Circle Network password', html, text });
+};
+
 // Free-form message from an operator to one subscriber. Replaces the WhatsApp
 // direct-message and broadcast paths. Returns whether it was delivered so
 // callers can report accurate counts.
