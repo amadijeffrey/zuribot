@@ -902,3 +902,148 @@ export const sendExpiryDigestToAdmins = async (
     logger.error('Failed to send expiry digest to admins', { error: error.message });
   }
 };
+
+// "You haven't finished paying" reminder for a checkout that was started and
+// abandoned. Pure — no I/O — so the copy can be tested without sending anything.
+//
+// Not plan-specific on purpose: the message is about completing registration, and
+// the button goes to login rather than to a Paystack link, because a stored
+// Paystack checkout URL may no longer be valid by the time this is read.
+export const buildPendingPaymentReminder = (
+  name: string | null | undefined,
+  loginUrl: string,
+): { subject: string; text: string; html: string } => {
+  const first = name?.trim().split(/\s+/)[0];
+  const greeting = first ? `Hi ${first},` : 'Hi there,';
+  const subject = "You're One Step Away From Joining Zuri Circle Network";
+
+  const text =
+    `${greeting}\n\n` +
+    `We noticed you started your registration with Zuri Circle Network but haven't completed ` +
+    `your payment yet, and we didn't want you to miss out.\n\n` +
+    `You're one step away from joining a verified network of over 1,400 African women, real ` +
+    `access to capital, mentorship, and a community built to help you grow, not just network.\n\n` +
+    `Complete your registration now, it takes less than two minutes: ${loginUrl}\n\n` +
+    `If you ran into an issue during checkout or have any questions, just reply to this email, ` +
+    `we're here to help.\n\n` +
+    `Warmly,\nThe Zuri Circle Network Team`;
+
+  const html =
+    `<p>${escapeHtml(greeting)}</p>` +
+    `<p>We noticed you started your registration with Zuri Circle Network but haven't completed ` +
+    `your payment yet, and we didn't want you to miss out.</p>` +
+    `<p>You're one step away from joining a verified network of over 1,400 African women, real ` +
+    `access to capital, mentorship, and a community built to help you grow, not just network.</p>` +
+    `<p>Complete your registration now, it takes less than two minutes:</p>` +
+    `<p><a href="${escapeHtml(loginUrl)}" style="display:inline-block;padding:12px 20px;` +
+    `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Complete Payment</a></p>` +
+    `<p>If you ran into an issue during checkout or have any questions, just reply to this email, ` +
+    `we're here to help.</p>` +
+    `<p>Warmly,<br>The Zuri Circle Network Team</p>`;
+
+  return { subject, text, html };
+};
+
+// Sends the reminder to an explicit address. Split out so a test can go to any
+// inbox without a database user behind it, and so the real path and the test path
+// share exactly the same builder, sender and configuration.
+//
+// Returns whether Resend accepted the mail. Never throws (sendMail swallows errors).
+export const sendPendingPaymentReminderToAddress = async (
+  to: string,
+  name: string | null | undefined,
+): Promise<boolean> => {
+  if (!env.FRONTEND_URL) {
+    // The button is the whole point of this email; without it there is nothing
+    // useful to send.
+    logger.error('Cannot send payment reminder — FRONTEND_URL is not set');
+    return false;
+  }
+
+  const loginUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/login`;
+  const { subject, text, html } = buildPendingPaymentReminder(name, loginUrl);
+  return sendMail({ to, subject, html, text });
+};
+
+export const sendPendingPaymentReminderEmail = async (userId: string): Promise<boolean> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user?.email) {
+    logger.error('Cannot send payment reminder — user has no email', { userId });
+    return false;
+  }
+  return sendPendingPaymentReminderToAddress(user.email, user.name);
+};
+
+// "Your membership is not yet active" nudge for someone who registered but never
+// finished the membership-activation step (PATCH /users/edit, which requires
+// `occupation` — see updateProfile). Pure — no I/O — so the copy can be tested
+// without sending anything.
+//
+// The button goes to login, not straight to the activation form, because the
+// member needs a session first and the frontend routes from there.
+export const buildMembershipActivationReminder = (
+  name: string | null | undefined,
+  loginUrl: string,
+): { subject: string; text: string; html: string } => {
+  const first = name?.trim().split(/\s+/)[0];
+  const greeting = first ? `Hi ${first},` : 'Hi there,';
+  const subject = 'Your Membership Is Not Yet Active';
+
+  const text =
+    `${greeting}\n\n` +
+    `Thank you for joining Zuri Circle Network, we're genuinely glad to have you.\n\n` +
+    `We noticed your membership hasn't been activated yet. That last step matters, it's what ` +
+    `unlocks your access to our community, resources, and everything else that comes with being ` +
+    `a verified member.\n\n` +
+    `Activate your membership now, it only takes a moment: ${loginUrl}\n\n` +
+    `If you're running into any trouble completing this step, just reply directly to this email ` +
+    `and we'll help you sort it out right away.\n\n` +
+    `Welcome to the network.\n\n` +
+    `Warmly,\nThe Zuri Circle Network Team`;
+
+  const html =
+    `<p>${escapeHtml(greeting)}</p>` +
+    `<p>Thank you for joining Zuri Circle Network, we're genuinely glad to have you.</p>` +
+    `<p>We noticed your membership hasn't been activated yet. That last step matters, it's what ` +
+    `unlocks your access to our community, resources, and everything else that comes with being ` +
+    `a verified member.</p>` +
+    `<p>Activate your membership now, it only takes a moment:</p>` +
+    `<p><a href="${escapeHtml(loginUrl)}" style="display:inline-block;padding:12px 20px;` +
+    `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Activate Now</a></p>` +
+    `<p>If you're running into any trouble completing this step, just reply directly to this email ` +
+    `and we'll help you sort it out right away.</p>` +
+    `<p>Welcome to the network.</p>` +
+    `<p>Warmly,<br>The Zuri Circle Network Team</p>`;
+
+  return { subject, text, html };
+};
+
+// Sends the reminder to an explicit address. Split out so a test can go to any
+// inbox without a database user behind it, and so the real path and the test path
+// share exactly the same builder, sender and configuration.
+//
+// Returns whether Resend accepted the mail. Never throws (sendMail swallows errors).
+export const sendMembershipActivationReminderToAddress = async (
+  to: string,
+  name: string | null | undefined,
+): Promise<boolean> => {
+  if (!env.FRONTEND_URL) {
+    // The button is the whole point of this email; without it there is nothing
+    // useful to send.
+    logger.error('Cannot send membership-activation reminder — FRONTEND_URL is not set');
+    return false;
+  }
+
+  const loginUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/login`;
+  const { subject, text, html } = buildMembershipActivationReminder(name, loginUrl);
+  return sendMail({ to, subject, html, text });
+};
+
+export const sendMembershipActivationReminderEmail = async (userId: string): Promise<boolean> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user?.email) {
+    logger.error('Cannot send membership-activation reminder — user has no email', { userId });
+    return false;
+  }
+  return sendMembershipActivationReminderToAddress(user.email, user.name);
+};
