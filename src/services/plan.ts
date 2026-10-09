@@ -47,6 +47,14 @@ export interface ResolvedPlan {
 }
 
 let cache: { plans: ResolvedPlan[]; at: number } | null = null;
+// Concurrent callers hitting a stale cache at once would each open their own
+// DB connection — under Vercel's connection_limit=1 this serialises them and
+// can starve an unrelated $transaction in the same request burst (seen in
+// production: two webhooks landed a second apart on a cold cache, and a
+// renewal's transaction timed out waiting for the one connection both plan
+// queries were fighting over). Sharing one in-flight refresh means any number
+// of concurrent callers make exactly one DB round trip.
+let inFlight: Promise<ResolvedPlan[]> | null = null;
 
 export const invalidatePlanCache = (): void => {
   cache = null;
@@ -140,24 +148,32 @@ const load = async (): Promise<ResolvedPlan[]> => {
 export const getAllPlans = async (): Promise<ResolvedPlan[]> => {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.plans;
 
-  const startedAt = Date.now();
-  const plans = await load();
-  const durationMs = Date.now() - startedAt;
+  if (!inFlight) {
+    inFlight = (async () => {
+      const startedAt = Date.now();
+      const plans = await load();
+      const durationMs = Date.now() - startedAt;
 
-  cache = { plans, at: Date.now() };
+      cache = { plans, at: Date.now() };
 
-  // Covers the whole of load() — a single round trip to Supabase (see its raw
-  // query), so if this is ever slow now, it's the database itself under load,
-  // not query shape.
-  //
-  // Logged at warn above the threshold so a slow database is visible in
-  // production, where the level is 'info' and the debug line below is dropped.
-  if (durationMs > SLOW_PLAN_LOAD_MS) {
-    logger.warn('Plan query slow', { durationMs, count: plans.length });
+      // Covers the whole of load() — a single round trip to Supabase (see its raw
+      // query), so if this is ever slow now, it's the database itself under load,
+      // not query shape.
+      //
+      // Logged at warn above the threshold so a slow database is visible in
+      // production, where the level is 'info' and the debug line below is dropped.
+      if (durationMs > SLOW_PLAN_LOAD_MS) {
+        logger.warn('Plan query slow', { durationMs, count: plans.length });
+      }
+
+      logger.debug('Plan cache refreshed', { count: plans.length, durationMs });
+      return plans;
+    })().finally(() => {
+      inFlight = null;
+    });
   }
 
-  logger.debug('Plan cache refreshed', { count: plans.length, durationMs });
-  return plans;
+  return inFlight;
 };
 
 // Plans a customer may subscribe to: active, and with at least one active price.
