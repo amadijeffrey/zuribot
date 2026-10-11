@@ -147,15 +147,19 @@ export const initializePayment = async (
       email,
       amount: price.amount,
       reference,
-      // Card only. Bank transfer/USSD produce a non-reusable authorization, so
-      // Paystack cannot auto-charge the next cycle — the customer would appear
-      // subscribed but silently never renew. Recurring billing requires a
-      // reusable card authorization regardless of the amount.
-      channels: ['card'],
+      // Card + bank: Paystack's own hosted page offers the choice. Bank
+      // transfer/USSD still produce a non-reusable-looking authorization
+      // (authorization.reusable: false), but custom_filters.recurring below
+      // tells Paystack this charge needs a recurring-capable channel, and
+      // verified in sandbox: a bank authorization obtained this way still
+      // works for POST /subscription and gets auto-charged on schedule —
+      // reusable: false does not mean what it implies for this channel.
+      channels: ['card', 'bank'],
       ...(callbackUrl ? { callback_url: callbackUrl } : {}),
       metadata: {
         userId,
         planId,
+        custom_filters: { recurring: true },
         custom_fields: [
           {
             display_name: 'Plan',
@@ -264,6 +268,11 @@ export const processWebhookEvent = async (event: any): Promise<void> => {
 
     case 'charge.dispute.resolve':
       await handleDisputeResolved(event.data);
+      break;
+
+    case 'direct_debit.authorization.created':
+    case 'direct_debit.authorization.active':
+      await handleDirectDebitAuthorizationEvent(event.event, event.data);
       break;
 
     default:
@@ -592,18 +601,34 @@ const handleInitialPayment = async (reference: string, data: any): Promise<void>
 
   const customerCode = data.customer?.customer_code;
   const authorizationCode = data.authorization?.authorization_code;
+  // Not channel-specific: the channel NAME for a direct-debit mandate differs
+  // between sandbox ("bank") and live ("direct_debit"), confirmed from real
+  // payloads in both modes — keying off the string would silently miss one of
+  // them. What actually matters is Paystack's own reusable flag. false means
+  // the mandate isn't billable yet (confirmed empirically in sandbox: a
+  // subscription created from it fails every renewal with "Empty response
+  // from charge auth"); creating it now would just mean disabling and
+  // recreating it later, so defer entirely to
+  // handleDirectDebitAuthorizationEvent. Card is always reusable: true, so
+  // this never affects it.
+  const authNotYetBillable = data.authorization?.reusable === false;
 
   const paystackSub =
-    customerCode && authorizationCode && price.paystackPlanCode
+    customerCode && authorizationCode && price.paystackPlanCode && !authNotYetBillable
       ? await createPaystackSubscription(customerCode, price.paystackPlanCode, authorizationCode)
       : null;
 
   if (!paystackSub) {
-    logger.warn('No Paystack subscription code at activation; subscription.create webhook will backfill if it arrives', {
-      reference,
-      hasCustomerCode: !!customerCode,
-      hasAuthorizationCode: !!authorizationCode,
-    });
+    logger.warn(
+      authNotYetBillable
+        ? 'Authorization not yet reusable — deferring Paystack subscription creation until direct_debit.authorization.active'
+        : 'No Paystack subscription code at activation; subscription.create webhook will backfill if it arrives',
+      {
+        reference,
+        hasCustomerCode: !!customerCode,
+        hasAuthorizationCode: !!authorizationCode,
+      },
+    );
   }
 
   try {
@@ -867,6 +892,139 @@ const tryRecurringRenewalFromCharge = async (data: any): Promise<boolean> => {
     raw: data,
   });
   return true;
+};
+
+// Direct debit mandates can come back from charge.success with
+// authorization.reusable: false — not yet billable, even though it looks like
+// a normal authorization object (confirmed empirically in sandbox:
+// subscriptions bound to one fail every renewal with "Empty response from
+// charge auth"). Paystack's documented signal that such a mandate later
+// becomes usable is this pair of events: .created when it exists but isn't
+// active, .active once it is — this handler exists so that path is covered.
+//
+// In practice, across every real charge seen this session — sandbox (always
+// reusable: false) and live (reusable: true, and auto-renewed correctly one
+// hour later without ever needing this event) — neither event has ever
+// fired. They may simply not apply to this integration path (channels +
+// custom_filters.recurring via /transaction/initialize), only to Paystack's
+// separate "create a mandate via charge" flow (POST /charge with a
+// direct_debit object), which this codebase does not use. This handler stays
+// in as a safety net in case some bank/scenario does need it, but is not the
+// mechanism actually relied on — see handleInitialPayment's reusable check.
+//
+// The exact payload shape is unconfirmed since it has never been observed, so
+// matching is defensive: try authorization_code first (in case it's the same
+// code charge.success already gave us, just now flagged active), then
+// customer_code, mirroring tryRecurringRenewalFromCharge's own fallback order.
+const handleDirectDebitAuthorizationEvent = async (eventName: string, data: any): Promise<void> => {
+  logger.info('Direct debit authorization event received', { event: eventName, data });
+
+  const authorizationCode = data?.authorization_code;
+  const customerCode = data?.customer?.customer_code;
+
+  if (eventName === 'direct_debit.authorization.created') {
+    // Mandate exists but isn't confirmed billable yet — nothing to act on until
+    // .active arrives.
+    return;
+  }
+
+  if (!authorizationCode) {
+    logger.warn('direct_debit.authorization.active missing authorization_code — cannot act on it', { data });
+    return;
+  }
+
+  const findBy = (where: object) =>
+    prisma.subscription.findMany({
+      where: { status: { not: 'CANCELLED' as const }, ...where },
+      orderBy: { createdAt: 'desc' },
+    });
+
+  let candidates = await findBy({ paystackAuthorizationCode: authorizationCode });
+  let matchedBy = 'authorization';
+  if (candidates.length === 0 && customerCode) {
+    candidates = await findBy({ paystackCustomerCode: customerCode });
+    matchedBy = 'customer';
+  }
+
+  if (candidates.length === 0) {
+    logger.warn('direct_debit.authorization.active did not match any subscription', { authorizationCode, customerCode });
+    return;
+  }
+
+  if (candidates.length > 1) {
+    await alertAdmins('direct_debit.authorization.active matched multiple subscriptions — not binding any, to avoid picking the wrong one', {
+      authorizationCode,
+      customerCode,
+      subscriptionIds: candidates.map((s) => s.id).join(', '),
+    });
+    return;
+  }
+
+  const subscription = candidates[0];
+  logger.info('Matched direct_debit.authorization.active to subscription', {
+    subscriptionId: subscription.id,
+    matchedBy,
+    authorizationCode,
+  });
+
+  if (subscription.paystackAuthorizationCode === authorizationCode && subscription.paystackSubscriptionCode) {
+    logger.info('Subscription already bound to this authorization — nothing to do', { subscriptionId: subscription.id });
+    return;
+  }
+
+  const effectiveCustomerCode = customerCode ?? subscription.paystackCustomerCode;
+  if (!effectiveCustomerCode) {
+    await alertAdmins('direct_debit.authorization.active matched a subscription with no known Paystack customer code — cannot bind', {
+      subscriptionId: subscription.id,
+      authorizationCode,
+    });
+    return;
+  }
+
+  const price = await priceForSubscription(subscription.planId, subscription.planPriceId);
+  if (!price) {
+    await alertAdmins('direct_debit.authorization.active matched a subscription whose plan/price could not be resolved — cannot bind', {
+      subscriptionId: subscription.id,
+      planId: subscription.planId,
+      authorizationCode,
+    });
+    return;
+  }
+
+  // Normally nothing exists yet — handleInitialPayment deliberately skips
+  // creating a subscription for a bank-channel charge, leaving this event as
+  // the only place it gets created. This branch only runs if one somehow
+  // exists anyway (a backfill race, or a duplicate .active delivery bound to
+  // a different authorization) — it would be bound to a premature,
+  // non-billable authorization, so disable it before creating the real one
+  // rather than leaving two subscriptions alive for the same customer/plan.
+  if (subscription.paystackSubscriptionCode && subscription.paystackEmailToken) {
+    await disablePaystackSubscription(subscription.paystackSubscriptionCode, subscription.paystackEmailToken);
+  }
+
+  const newSub = await createPaystackSubscription(effectiveCustomerCode, price.paystackPlanCode, authorizationCode);
+  if (!newSub) {
+    await alertAdmins('Failed to create Paystack subscription from an active direct debit mandate', {
+      subscriptionId: subscription.id,
+      authorizationCode,
+    });
+    return;
+  }
+
+  await prisma.subscription.update({
+    where: { id: subscription.id },
+    data: {
+      paystackAuthorizationCode: authorizationCode,
+      paystackSubscriptionCode: newSub.code,
+      paystackEmailToken: newSub.emailToken,
+      paystackCustomerCode: effectiveCustomerCode,
+    },
+  });
+
+  logger.info('Rebound subscription to the now-active direct debit mandate', {
+    subscriptionId: subscription.id,
+    newSubscriptionCode: newSub.code,
+  });
 };
 
 // invoice.update is Paystack's reliable signal that a recurring billing cycle
@@ -1179,9 +1337,14 @@ const applyRenewalCharge = async (
     const newPrice = await priceForSubscription(sub.planId, sub.planPriceId);
     const customerCode = data.customer?.customer_code ?? sub.paystackCustomerCode;
     const authorizationCode = data.authorization?.authorization_code ?? sub.paystackAuthorizationCode;
+    // See handleInitialPayment — a non-reusable authorization isn't billable
+    // until direct_debit.authorization.active fires, so defer creation to
+    // that handler instead of binding this plan change to a dead
+    // authorization. Keyed off reusable, not channel name — see there for why.
+    const authNotYetBillable = data.authorization?.reusable === false;
 
     const created =
-      customerCode && authorizationCode && newPrice
+      customerCode && authorizationCode && newPrice && !authNotYetBillable
         ? await createPaystackSubscription(customerCode, newPrice.paystackPlanCode, authorizationCode)
         : null;
 
@@ -1274,14 +1437,16 @@ export const initializeRenewalPayment = async (
       email,
       amount: price.amount,
       reference,
-      // Card only — a renewal must leave behind a reusable authorization, or the
-      // subscription can never auto-charge again. See initializePayment.
-      channels: ['card'],
+      // Card + bank — see initializePayment for why both channels plus
+      // custom_filters.recurring are safe for a charge that must leave behind
+      // an authorization usable for future auto-renewals.
+      channels: ['card', 'bank'],
       metadata: {
         userId: subscription.userId,
         planId: subscription.planId,
         subscriptionId: subscription.id,
         renewal: true,
+        custom_filters: { recurring: true },
       },
     });
 
@@ -1775,7 +1940,10 @@ export const initializePlanChange = async (
       email,
       amount: price.amount,
       reference,
-      channels: ['card'],
+      // Card + bank — see initializePayment for why both channels plus
+      // custom_filters.recurring are safe for a charge that must leave behind
+      // an authorization usable for future auto-renewals.
+      channels: ['card', 'bank'],
       ...(callbackUrl ? { callback_url: callbackUrl } : {}),
       metadata: {
         userId: subscription.userId,
@@ -1783,6 +1951,7 @@ export const initializePlanChange = async (
         planId: newPlanId,
         interval: price.interval,
         planChange: true,
+        custom_filters: { recurring: true },
       },
     });
 
