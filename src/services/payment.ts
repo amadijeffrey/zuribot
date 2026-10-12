@@ -896,37 +896,36 @@ const tryRecurringRenewalFromCharge = async (data: any): Promise<boolean> => {
 
 // Direct debit mandates can come back from charge.success with
 // authorization.reusable: false — not yet billable, even though it looks like
-// a normal authorization object (confirmed empirically in sandbox:
-// subscriptions bound to one fail every renewal with "Empty response from
-// charge auth"). Paystack's documented signal that such a mandate later
-// becomes usable is this pair of events: .created when it exists but isn't
-// active, .active once it is — this handler exists so that path is covered.
+// a normal authorization object (confirmed empirically in sandbox: subscriptions
+// bound to one fail every renewal with "Empty response from charge auth", and
+// in one live bank_transfer case too). Paystack's documented signal that such a
+// mandate later becomes usable is this pair of events: .created when it exists
+// but isn't active, .active once it is — per Paystack, .active can take up to
+// 24h after .created. This handler is what actually binds the Paystack
+// subscription once that happens; handleInitialPayment deliberately skips
+// creating one up front for a non-reusable authorization specifically so this
+// is the only place it gets created for that case.
 //
-// In practice, across every real charge seen this session — sandbox (always
-// reusable: false) and live (reusable: true, and auto-renewed correctly one
-// hour later without ever needing this event) — neither event has ever
-// fired. They may simply not apply to this integration path (channels +
-// custom_filters.recurring via /transaction/initialize), only to Paystack's
-// separate "create a mandate via charge" flow (POST /charge with a
-// direct_debit object), which this codebase does not use. This handler stays
-// in as a safety net in case some bank/scenario does need it, but is not the
-// mechanism actually relied on — see handleInitialPayment's reusable check.
-//
-// The exact payload shape is unconfirmed since it has never been observed, so
-// matching is defensive: try authorization_code first (in case it's the same
-// code charge.success already gave us, just now flagged active), then
-// customer_code, mirroring tryRecurringRenewalFromCharge's own fallback order.
+// .created IS confirmed to fire for this integration path (channels +
+// custom_filters.recurring via /transaction/initialize) — a real payload
+// was observed carrying:
+//   { reference, authorization_code, customer: { code, email, ... },
+//     active: false, channel, reusable: false, ... }
+// Note customer.code, NOT customer.customer_code like charge.success uses —
+// confirmed from that real payload, not assumed. .active itself has still
+// never been observed, so its exact shape is inferred from .created's.
 const handleDirectDebitAuthorizationEvent = async (eventName: string, data: any): Promise<void> => {
   logger.info('Direct debit authorization event received', { event: eventName, data });
 
-  const authorizationCode = data?.authorization_code;
-  const customerCode = data?.customer?.customer_code;
-
   if (eventName === 'direct_debit.authorization.created') {
     // Mandate exists but isn't confirmed billable yet — nothing to act on until
-    // .active arrives.
+    // .active arrives (can take up to 24h per Paystack).
     return;
   }
+
+  const reference: string | undefined = data?.reference;
+  const authorizationCode: string | undefined = data?.authorization_code;
+  const customerCode: string | undefined = data?.customer?.code ?? data?.customer?.customer_code;
 
   if (!authorizationCode) {
     logger.warn('direct_debit.authorization.active missing authorization_code — cannot act on it', { data });
@@ -939,8 +938,26 @@ const handleDirectDebitAuthorizationEvent = async (eventName: string, data: any)
       orderBy: { createdAt: 'desc' },
     });
 
-  let candidates = await findBy({ paystackAuthorizationCode: authorizationCode });
-  let matchedBy = 'authorization';
+  // reference is the most direct link back to the originating charge — tried
+  // first because, unlike authorization/customer code, it can't match more
+  // than one subscription.
+  let candidates: Awaited<ReturnType<typeof findBy>> = [];
+  let matchedBy = 'none';
+  if (reference) {
+    const payment = await prisma.payment.findUnique({ where: { reference } });
+    if (payment?.subscriptionId) {
+      const sub = await prisma.subscription.findUnique({ where: { id: payment.subscriptionId } });
+      if (sub && sub.status !== 'CANCELLED') {
+        candidates = [sub];
+        matchedBy = 'reference';
+      }
+    }
+  }
+
+  if (candidates.length === 0) {
+    candidates = await findBy({ paystackAuthorizationCode: authorizationCode });
+    matchedBy = 'authorization';
+  }
   if (candidates.length === 0 && customerCode) {
     candidates = await findBy({ paystackCustomerCode: customerCode });
     matchedBy = 'customer';
