@@ -693,7 +693,7 @@ export const sendGracePeriodEmail = async (userId: string, planId: string): Prom
     `period to renew before access is removed.\n\n` +
     (manageCardUrl
       ? `Two ways to sort this out:\n` +
-        `• If there simply weren't funds available, top up — we retry automatically, nothing else needed.\n` +
+        `• If there simply weren't funds available, top up and click the button to renew your subscription.\n` +
         `• If the card has expired or was declined, replace it here (this also fixes future renewals): ${manageCardUrl}\n\n`
       : '') +
     (loginUrl ? `Renew to keep your access: ${loginUrl}\n\n` : `Renew to keep your access via your dashboard.\n\n`) +
@@ -705,7 +705,7 @@ export const sendGracePeriodEmail = async (userId: string, planId: string): Prom
     `<strong>${GRACE_PERIOD_DAYS}-day grace period</strong> to renew before access is removed.</p>` +
     (manageCardUrl
       ? `<p>Two ways to sort this out:</p>` +
-        `<ul><li>If there simply weren't funds available, top up — we retry automatically, nothing else needed.</li>` +
+        `<ul><li>If there simply weren't funds available, top up and click the button to renew your subscription.</li>` +
         `<li>If the card has expired or was declined, replace it below. This also fixes future renewals.</li></ul>` +
         `<p><a href="${escapeHtml(manageCardUrl)}" style="display:inline-block;padding:12px 20px;` +
         `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Update your card</a></p>`

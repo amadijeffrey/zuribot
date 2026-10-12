@@ -419,6 +419,30 @@ export const getPayments = async (req: Request, res: Response): Promise<void> =>
   if (status) where.status = status;
   if (hours) where.createdAt = { gte: new Date(Date.now() - hours * 60 * 60 * 1000) };
 
+  // A PENDING payment can be superseded: the user abandoned this checkout but
+  // went on to subscribe to the same plan via a different (later) payment —
+  // see initializePayment's in-flight-checkout comment. Excluded only here,
+  // not for other statuses, since a SUCCESS/FAILED row is a settled fact, not
+  // something a later payment can make stale. Scoped to subscriptionId null —
+  // a renewal/plan-change payment is pre-linked to the subscription it's for,
+  // so it can't be superseded the same way (mirrors send-pending-payment-
+  // reminders.ts's own scoping).
+  if (status === 'PENDING') {
+    const superseded = await prisma.$queryRaw<{ id: string }[]>`
+      SELECT p.id
+      FROM payments p
+      WHERE p.status = 'PENDING'
+        AND p.subscription_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM subscriptions s
+          WHERE s.user_id = p.user_id
+            AND s.plan_id = p.plan_id
+            AND s.status IN ('ACTIVE', 'GRACE')
+        )
+    `;
+    if (superseded.length) where.id = { notIn: superseded.map((s) => s.id) };
+  }
+
   const [payments, total, sum] = await Promise.all([
     prisma.payment.findMany({
       where,
