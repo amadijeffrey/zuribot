@@ -2,7 +2,7 @@ import axios from 'axios';
 import { prisma } from '../config/database';
 import { env } from '../config/env';
 import { GRACE_PERIOD_DAYS } from '../config/constants';
-import { resolvePlan, getFreeGroupBenefit, priceForSubscription } from './plan';
+import { resolvePlan, getFreeGroupBenefits, priceForSubscription } from './plan';
 import { logger } from '../utils/logger';
 
 // Resend's HTTP API. Plain HTTPS keeps this working on serverless hosts that
@@ -341,7 +341,7 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
     return;
   }
 
-  const free = await getFreeGroupBenefit();
+  const freeBenefits = await getFreeGroupBenefits();
   const subscriptions = await prisma.subscription.findMany({
     where: { userId, status: { in: ['ACTIVE', 'GRACE'] } },
   });
@@ -350,7 +350,9 @@ export const sendMembershipActivationEmail = async (userId: string): Promise<voi
   );
 
   const groups: { name: string; inviteLink: string }[] = [];
-  if (free?.inviteLink) groups.push({ name: free.name, inviteLink: free.inviteLink });
+  for (const f of freeBenefits) {
+    if (f.inviteLink) groups.push({ name: f.name, inviteLink: f.inviteLink });
+  }
   for (const plan of plans) {
     for (const g of plan.groupLinks) {
       if (!groups.some((existing) => existing.inviteLink === g.inviteLink)) groups.push(g);
@@ -452,10 +454,10 @@ export const sendWelcomeEmail = async (userId: string): Promise<boolean> => {
     return false;
   }
 
-  const free = await getFreeGroupBenefit();
+  const freeBenefits = await getFreeGroupBenefits();
   const greeting = user.name ? `Hi ${user.name},` : 'Hi,';
 
-  if (!free) {
+  if (freeBenefits.length === 0) {
     logger.error('Welcome email — free group benefit not configured', { userId });
   }
 
