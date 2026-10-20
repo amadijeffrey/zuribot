@@ -58,24 +58,32 @@ let inFlight: Promise<ResolvedPlan[]> | null = null;
 
 export const invalidatePlanCache = (): void => {
   cache = null;
-  freeBenefitCache = undefined;
+  freeBenefitsCache = undefined;
 };
 
-// The group every member gets on registration. Not part of any plan, so it never
-// appears in plan entitlements and is never revoked when a subscription lapses.
+// The groups every member gets on registration. Not part of any plan, so they
+// never appear in plan entitlements and are never revoked when a subscription
+// lapses. One or more Benefit rows, coded "group-free" (the original) and
+// "group-free-2", "group-free-3", etc. for any added since — same prefix
+// convention as a plan's own multi-benefit rows (e.g. "group-premium-1").
 export const FREE_GROUP_BENEFIT_CODE = 'group-free';
 
-let freeBenefitCache: BenefitInfo | null | undefined;
+let freeBenefitsCache: BenefitInfo[] | undefined;
 
-export const getFreeGroupBenefit = async (): Promise<BenefitInfo | null> => {
-  if (freeBenefitCache !== undefined) return freeBenefitCache;
+export const getFreeGroupBenefits = async (): Promise<BenefitInfo[]> => {
+  if (freeBenefitsCache !== undefined) return freeBenefitsCache;
 
-  const row = await prisma.benefit.findUnique({ where: { code: FREE_GROUP_BENEFIT_CODE } });
-  freeBenefitCache =
-    row && row.isActive
-      ? { code: row.code, type: row.type, name: row.name, inviteLink: row.inviteLink }
-      : null;
-  return freeBenefitCache;
+  const rows = await prisma.benefit.findMany({
+    where: { code: { startsWith: FREE_GROUP_BENEFIT_CODE }, isActive: true },
+    orderBy: { code: 'asc' },
+  });
+  freeBenefitsCache = rows.map((row) => ({
+    code: row.code,
+    type: row.type,
+    name: row.name,
+    inviteLink: row.inviteLink,
+  }));
+  return freeBenefitsCache;
 };
 
 // Shape returned by load()'s raw query — prices/benefits arrive pre-aggregated
