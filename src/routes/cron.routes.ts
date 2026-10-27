@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { runExpirySweep } from '../services/subscription';
 import { runWorksheetReminders } from '../services/worksheet-reminder';
+import { runPremiumUpgradeNudge } from '../services/premium-upgrade-nudge';
 // import { runReconciliation } from '../services/payment'; // off the schedule for now
 import { cronAuthMiddleware } from '../middleware/cron-auth';
-import { recordJobSuccess, SWEEP_JOB, WORKSHEET_JOB } from '../services/job-state';
+import { recordJobSuccess, SWEEP_JOB, WORKSHEET_JOB, PREMIUM_UPGRADE_NUDGE_JOB } from '../services/job-state';
 import { asyncHandler } from '../middleware/error';
 import { logger } from '../utils/logger';
 
@@ -82,6 +83,27 @@ router.get('/worksheet-reminders', asyncHandler(async (_req, res) => {
   } catch (error: any) {
     logger.error('Worksheet reminder job failed', { error: error.message });
     res.status(500).json({ error: 'Worksheet reminders failed' });
+  }
+}));
+
+// GET /internal/cron/premium-upgrade-nudge — monthly nudge.
+//
+// Emails engaged members who registered in the last 30 days and have never
+// subscribed to any plan, encouraging a Premium upgrade — see
+// runPremiumUpgradeNudge for the exact criteria and the copy itself in
+// email.ts (buildPremiumUpgradeNudge).
+//
+// Scheduled for the 1st of the month, same cadence as worksheet-reminders —
+// see runPremiumUpgradeNudge for why that cadence needs no separate
+// already-sent tracking.
+router.get('/premium-upgrade-nudge', asyncHandler(async (_req, res) => {
+  try {
+    const result = await runPremiumUpgradeNudge();
+    await recordJobSuccess(PREMIUM_UPGRADE_NUDGE_JOB, { ...result });
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    logger.error('Premium upgrade nudge job failed', { error: error.message });
+    res.status(500).json({ error: 'Premium upgrade nudge failed' });
   }
 }));
 
