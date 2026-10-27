@@ -4,6 +4,7 @@ import { logger } from '../utils/logger';
 
 export const SWEEP_JOB = 'cron-sweep';
 export const WORKSHEET_JOB = 'worksheet-reminders';
+export const PREMIUM_UPGRADE_NUDGE_JOB = 'premium-upgrade-nudge';
 
 // The sweep is scheduled daily. Two missed days is a real outage rather than a
 // late run — Vercel's Hobby cron in particular fires anywhere within the hour,

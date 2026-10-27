@@ -1049,3 +1049,68 @@ export const sendMembershipActivationReminderEmail = async (userId: string): Pro
   }
   return sendMembershipActivationReminderToAddress(user.email, user.name);
 };
+
+// Premium-upgrade nudge for an engaged member who registered but has never
+// subscribed to any plan. Pure — no I/O — so the copy can be tested without
+// sending anything.
+export const buildPremiumUpgradeNudge = (
+  name: string | null | undefined,
+  loginUrl: string,
+): { subject: string; text: string; html: string } => {
+  const first = name?.trim().split(/\s+/)[0];
+  const greeting = first ? `Dear ${first},` : 'Dear friend,';
+  const subject = 'You Are Setting the Pace. Premium Meets You There';
+
+  const text =
+    `${greeting}\n\n` +
+    `We review engagement metrics across the network, and your consistency stands out. You are ` +
+    `showing up, and we believe Premium membership will genuinely serve where you are heading next.\n\n` +
+    `Premium unlocks accelerated access to institutional resources, including subsidized entry ` +
+    `pricing for funding programmes like GROW. We think you are ready for this level of access. ` +
+    `Upgrade via your dashboard whenever you are ready.\n\n` +
+    `${loginUrl}\n\n` +
+    `Warmly,\nThe Zuri Circle Network Team`;
+
+  const html =
+    `<p>${escapeHtml(greeting)}</p>` +
+    `<p>We review engagement metrics across the network, and your consistency stands out. You are ` +
+    `showing up, and we believe Premium membership will genuinely serve where you are heading next.</p>` +
+    `<p>Premium unlocks accelerated access to institutional resources, including subsidized entry ` +
+    `pricing for funding programmes like GROW. We think you are ready for this level of access. ` +
+    `Upgrade via your dashboard whenever you are ready.</p>` +
+    `<p><a href="${escapeHtml(loginUrl)}" style="display:inline-block;padding:12px 20px;` +
+    `background:#25D366;color:#fff;text-decoration:none;border-radius:6px;">Upgrade to Premium</a></p>` +
+    `<p>Warmly,<br>The Zuri Circle Network Team</p>`;
+
+  return { subject, text, html };
+};
+
+// Sends the nudge to an explicit address. Split out so a test can go to any
+// inbox without a database user behind it, and so the real path and the test path
+// share exactly the same builder, sender and configuration.
+//
+// Returns whether Resend accepted the mail. Never throws (sendMail swallows errors).
+export const sendPremiumUpgradeNudgeToAddress = async (
+  to: string,
+  name: string | null | undefined,
+): Promise<boolean> => {
+  if (!env.FRONTEND_URL) {
+    // The button is the whole point of this email; without it there is nothing
+    // useful to send.
+    logger.error('Cannot send premium-upgrade nudge — FRONTEND_URL is not set');
+    return false;
+  }
+
+  const loginUrl = `${env.FRONTEND_URL.replace(/\/$/, '')}/login`;
+  const { subject, text, html } = buildPremiumUpgradeNudge(name, loginUrl);
+  return sendMail({ to, subject, html, text });
+};
+
+export const sendPremiumUpgradeNudgeEmail = async (userId: string): Promise<boolean> => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user?.email) {
+    logger.error('Cannot send premium-upgrade nudge — user has no email', { userId });
+    return false;
+  }
+  return sendPremiumUpgradeNudgeToAddress(user.email, user.name);
+};
